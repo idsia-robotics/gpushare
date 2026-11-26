@@ -5,11 +5,11 @@
 Jobs wait for their turn instead of piling onto a busy GPU. Each GPU's owner gets it back on request. Everyone can see who is using what. Nothing runs in the background: it is just a shared folder of files.
 
 ```bash
-gpuq run $(gpuq join 0 train  `# queue on GPU 0, as job "train"` \
-  --mem 8G                    `# peak GPU memory you expect` \
-  --duration 2h               `# how long you'll hold the GPU` \
-  --reason "best effort"      `# how urgent it is, shown to everyone waiting` \
-) -- python train.py          # wait for your turn, run on that GPU, then free it
+gpuq run 0 train          `# queue on GPU 0, as job "train"` \
+  --mem 8G                `# peak GPU memory you expect` \
+  --duration 2h           `# how long you'll hold the GPU` \
+  --reason "best effort"  `# how urgent it is, shown to everyone waiting` \
+  -- python train.py      # wait for your turn, run on that GPU, then free it
 ```
 
 Agents (Claude Code, Codex, …) do this by themselves once you point them at [AGENTS.md](AGENTS.md).
@@ -76,15 +76,15 @@ sudo /srv/gpushare/setup.sh --install-pointers                             # tel
 
 ```bash
 gpuq status                                          # who owns, runs and waits for each GPU
-gpuq join 0 finetune --mem 12G --duration 3h --reason "deadline Dec 4"   # prints your job id
-gpuq run 1010-carol-finetune -- python train.py      # waits, runs on your GPU, cleans up after
+gpuq run 0 finetune --mem 12G --duration 3h --reason "deadline Dec 4" -- python train.py
+                                                     # joins, waits, runs on your GPU, cleans up after
 gpuq watch 1010-carol-finetune                       # shows pings to you as they arrive
 gpuq ping 1000-bob-llm-sweep "need gpu0 by 14:00, can you checkpoint?"
 ```
 
 | Also available | |
 |---|---|
-| `wait` · `start` · `leave` | wait for your turn, claim it, release it: for jobs you launch yourself |
+| `join` · `wait` · `start` · `leave` | queue, wait, claim, release, step by step: for jobs you launch yourself, or several commands on one reservation |
 | `reply` · `note` | answer a ping, or add a note to a lock |
 | `mine` · `check` | list your locks; ask "is it my turn?" (exit code 0 means yes) |
 | `renumber` · `adopt` · `prune` | move your place in line; re-attach a lock to a new session; delete your stale locks |
@@ -94,7 +94,7 @@ gpuq ping 1000-bob-llm-sweep "need gpu0 by 14:00, can you checkpoint?"
 **Using it from an agent:**
 - A lock stays valid as long as the agent's session does (Claude Code: `$CLAUDE_PID`), or the job does.
 - Run `gpuq run` or `gpuq wait` as a background task, and `gpuq watch` under a monitor so pings get noticed.
-- For jobs that must outlive the session: `nohup setsid gpuq run <id> -- <cmd> > run.log 2>&1 &`.
+- For jobs that must outlive the session: `nohup setsid gpuq run 0 train --mem … -- <cmd> > run.log 2>&1 &`.
 
 ## Maintain
 

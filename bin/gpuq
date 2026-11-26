@@ -470,6 +470,16 @@ def find_job(ident, gpus=None):
     die("no lock named %r (see: gpuq mine / gpuq status)" % ident, 3)
 
 
+def find_job_quiet(name):
+    out = []
+    for g in list_gpus():
+        try:
+            out.append(Lock(g, name))
+        except (FileNotFoundError, ValueError):
+            pass
+    return out
+
+
 def require_owner(locks):
     for l in locks:
         if l.owner != USER and not IS_ROOT:
@@ -732,7 +742,22 @@ def cmd_mine(a):
     return 0
 
 
+GPU_SPEC_RE = re.compile(r"^(gpu)?\d+(,(gpu)?\d+)*$")
+
+
 def cmd_join(a):
+    print(do_join(a))
+    print("  next: gpuq run %s -- <cmd>   (or: gpuq wait/start/leave %s for jobs you launch yourself)"
+          % (_last_join, _last_join), file=sys.stderr)
+    return 0
+
+
+_last_join = None
+
+
+def do_join(a):
+    """Create the lock file(s); returns the job id. Progress goes to stderr."""
+    global _last_join
     gpus = resolve_gpus(a.gpus)
     job = sanitize_job(a.job)
     owner_pid = a.pid or detect_owner_pid()
@@ -791,7 +816,7 @@ def cmd_join(a):
             for p in made:
                 os.unlink(p)
             die("%s already exists; pick another --number or job name" % name)
-    print(name)
+    _last_join = name
     for g in gpus:
         me = Lock(g, name)
         ahead = [l.name for l in scan(g) if l.valid and l.name != name and
@@ -804,9 +829,7 @@ def cmd_join(a):
                 if l.valid and l.state == "running" and l.name != name:
                     print("  gpu%d: %s is running; ask it to yield: gpuq ping %s \"...\"" % (
                         g.index, l.name, l.name), file=sys.stderr)
-    print("  next: gpuq run %s -- <cmd>   (or: gpuq wait %s; gpuq start %s)" % (name, name, name),
-          file=sys.stderr)
-    return 0
+    return name
 
 
 def cmd_check(a):
@@ -900,20 +923,56 @@ def watcher_thread(inos, stop, interval=10):
         first = False
 
 
+RUN_USAGE = ("usage: gpuq run <gpus> <job> --mem M --duration D --reason R [join options] -- <command>\n"
+             "   or: gpuq run <id> -- <command>        (for a lock you created with gpuq join)")
+
+
 def cmd_run(a):
-    cmd = a.cmd[1:] if a.cmd and a.cmd[0] == "--" else a.cmd
+    cmd = a.cmd
     if not cmd:
-        die("usage: gpuq run <id> -- <command> [args...]")
-    mine = find_job(a.id)
+        die(RUN_USAGE)
+    created = GPU_SPEC_RE.match(a.target) is not None
+    if created:  # `gpuq run 0 train --mem ... -- cmd`: join first, then run
+        if not a.job:
+            die(RUN_USAGE)
+        missing = ["--" + f for f in ("mem", "duration", "reason") if not getattr(a, f)]
+        if missing:
+            die("joining the queue needs %s\n%s" % (", ".join(missing), RUN_USAGE))
+        a.gpus = a.target
+        ident = do_join(a)
+        print("[gpuq %s] joined the queue as %s" % (hhmm(), ident), file=sys.stderr, flush=True)
+    else:
+        if a.job:
+            die("unexpected argument %r: %r is a job id, so no job name is needed\n%s" % (
+                a.job, a.target, RUN_USAGE))
+        ident = a.target
+    mine = find_job(ident)
     require_owner(mine)
     me_pid = os.getpid()
     for l in mine:  # keep the lock alive while this process waits/runs, even if the session dies
         append_line(l.path, "PID", "%d %s gpuq-run" % (me_pid, proc_start(me_pid)))
-    while True:
-        wait_turn(a.id, a.poll, a.ignore_unregistered, out=sys.stderr)
-        mine, ok, _ = try_claim(a.id, a.ignore_unregistered, me_pid)
-        if ok:
-            break
+
+    def bail(sig, _frame):
+        raise SystemExit(128 + sig)
+
+    for sg in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sg, bail)
+    try:
+        while True:
+            wait_turn(ident, a.poll, a.ignore_unregistered, out=sys.stderr)
+            mine, ok, _ = try_claim(ident, a.ignore_unregistered, me_pid)
+            if ok:
+                break
+    except (KeyboardInterrupt, SystemExit):
+        if created:  # we made this lock, so don't leave it behind if we never started
+            for l in find_job_quiet(ident):
+                try:
+                    append_line(l.path, "STATUS", "done (gpuq run stopped before the job started)")
+                    os.unlink(l.path)
+                except OSError:
+                    pass
+            print("[gpuq %s] stopped before starting; removed %s" % (hhmm(), ident), file=sys.stderr)
+        raise
     inos = [l.ino for l in mine]
     env = dict(os.environ)
     env.update(cuda_env(mine))
@@ -1086,11 +1145,11 @@ def main():
         description="Cooperative GPU queue. Read %s/AGENTS.md first." % ROOT,
         epilog="""typical use:
   gpuq status                                   # who is assigned / running / queued
-  gpuq join 4 resnet-sweep --mem 8G --duration 3h --reason "best effort"
-  gpuq run 1000-%s-resnet-sweep -- python train.py   # waits, sets CUDA_VISIBLE_DEVICES, cleans up
+  gpuq run 4 resnet-sweep --mem 8G --duration 3h --reason "best effort" -- python train.py
+                                                # joins, waits, sets CUDA_VISIBLE_DEVICES, cleans up
   gpuq watch 1000-%s-resnet-sweep               # while it runs: see pings, then gpuq reply
   gpuq ping 1000-other-job "assigned user needs gpu4 by 15:00, can you checkpoint?"
-""" % (USER, USER))
+""" % USER)
     sub = p.add_subparsers(dest="cmd", metavar="command")
 
     def add(name, fn, help_):
@@ -1108,23 +1167,28 @@ def main():
 
     add("mine", cmd_mine, "list your own locks")
 
-    sp = add("join", cmd_join, "join the queue of one or more GPUs; prints the job id")
+    def join_opts(sp, required):
+        sp.add_argument("--mem", required=required, help="peak GPU memory you expect, e.g. 10G (be honest)")
+        sp.add_argument("--duration", required=required, help="expected run time, e.g. 45m, 6h, 2d")
+        sp.add_argument("--reason", required=required,
+                        help='why / how urgent, e.g. "best effort", "paper deadline 2026-12-01"')
+        sp.add_argument("--notes", help="anything else useful for others")
+        sp.add_argument("--share", action="store_true",
+                        help="others may co-run if memory fits; you cap your memory")
+        sp.add_argument("--no-preempt", dest="preemptible", action="store_false",
+                        help="declare that you cannot checkpoint/yield quickly (default: preemptible)")
+        g = sp.add_mutually_exclusive_group()
+        g.add_argument("--front", action="store_true",
+                       help="jump ahead of everyone (assigned user, or justified urgency in --reason)")
+        g.add_argument("--number", type=int, help="explicit queue number 0-9999")
+        sp.add_argument("--pid", type=int, help="pid that keeps the lock alive (default: $CLAUDE_PID or "
+                                                "first non-shell ancestor)")
+
+    sp = add("join", cmd_join, "join the queue of one or more GPUs and print the job id "
+                               "(use when you launch the job yourself; otherwise just use gpuq run)")
     sp.add_argument("gpus", help="GPU index, or comma list for multi-GPU jobs (e.g. 0,1)")
     sp.add_argument("job", help="short job name, [a-z0-9._-]")
-    sp.add_argument("--mem", required=True, help="peak GPU memory you expect, e.g. 10G (be honest)")
-    sp.add_argument("--duration", required=True, help="expected run time, e.g. 45m, 6h, 2d")
-    sp.add_argument("--reason", required=True,
-                    help='why / how urgent, e.g. "best effort", "paper deadline 2026-12-01"')
-    sp.add_argument("--notes", help="anything else useful for others")
-    sp.add_argument("--share", action="store_true", help="others may co-run if memory fits; you cap your memory")
-    sp.add_argument("--no-preempt", dest="preemptible", action="store_false",
-                    help="declare that you cannot checkpoint/yield quickly (default: preemptible)")
-    g = sp.add_mutually_exclusive_group()
-    g.add_argument("--front", action="store_true",
-                   help="jump ahead of everyone (assigned user, or justified urgency in --reason)")
-    g.add_argument("--number", type=int, help="explicit queue number 0-9999")
-    sp.add_argument("--pid", type=int, help="pid that keeps the lock alive (default: $CLAUDE_PID or "
-                                            "first non-shell ancestor)")
+    join_opts(sp, True)
 
     sp = add("check", cmd_check, "one-shot: is it my turn? exit 0 yes, 1 no, 3 lock missing/stale")
     sp.add_argument("id")
@@ -1141,11 +1205,14 @@ def main():
     sp.add_argument("--job-pid", type=int, help="pid of the job you launched (keeps the lock alive)")
     turn_opts(sp)
 
-    sp = add("run", cmd_run, "wait for your turn, run a command on your GPU(s), then remove the lock")
-    sp.add_argument("id")
+    sp = add("run", cmd_run, "join the queue (or use an existing lock), wait for your turn, run a command "
+                             "on your GPU(s), then remove the lock")
+    sp.usage = RUN_USAGE[len("usage: "):]
+    sp.add_argument("target", help="GPU(s) to queue on (e.g. 0 or 0,1), or the id of a lock from gpuq join")
+    sp.add_argument("job", nargs="?", help="job name, when TARGET is a GPU")
     sp.add_argument("--poll", type=float, default=30)
     turn_opts(sp)
-    sp.add_argument("cmd", nargs=argparse.REMAINDER, help="-- command [args...]")
+    join_opts(sp, False)
 
     for name, verb, h in (("ping", "PING", "send a message to a lock's owner (e.g. ask them to yield)"),
                           ("reply", "ACK", "answer a ping on your own lock"),
@@ -1175,7 +1242,14 @@ def main():
     sp = add("prune", cmd_prune, "delete your stale/done locks (root: everyone's)")
     sp.add_argument("--dry-run", action="store_true")
 
-    a = p.parse_args()
+    argv = sys.argv[1:]
+    cmd = None
+    if argv and argv[0] == "run" and "--" in argv:  # everything after -- belongs to the job
+        i = argv.index("--")
+        argv, cmd = argv[:i], argv[i + 1:]
+    a = p.parse_args(argv)
+    if getattr(a, "fn", None) is cmd_run:
+        a.cmd = cmd
     if not getattr(a, "fn", None):
         p.print_help()
         return 2

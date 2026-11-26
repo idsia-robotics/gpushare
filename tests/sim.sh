@@ -126,6 +126,22 @@ kill -TERM $RP; wait $RP; RC=$?
 expect "SIGTERM -> 128+15" 143 $RC
 [[ ! -e $T/gpu4/$W2 ]] && ok "lock removed after SIGTERM" || bad "lock left after SIGTERM"
 
+echo "== run joins the queue by itself"
+OUT=$($G run 3 inline --mem 1G --duration 1m --reason t --pid $P1 -- sh -c 'echo "VIS=$CUDA_VISIBLE_DEVICES"' 2>/dev/null)
+expect "run <gpu> <job> joins and runs" "VIS=GPU-fake-3" "$OUT"
+expect "its lock is removed afterwards" "" "$(ls $T/gpu3 | grep -E '^[0-9]{4}-')"
+$G run 3 inline2 --mem 1G -- true 2>&1 | grep -q "needs --duration, --reason" && ok "missing join flags rejected" || bad "missing flags accepted"
+$G run 3 inline3 --mem 1G --duration 1m --reason t 2>&1 | grep -q "usage: gpuq run" && ok "missing -- command rejected" || bad "missing command accepted"
+expect "nothing left behind by rejected runs" "" "$(ls $T/gpu3 | grep -E '^[0-9]{4}-')"
+B1=$($G join 3 blocker --mem 1G --duration 1m --reason t --pid $P1 2>/dev/null); $G start $B1 >/dev/null 2>&1
+$G run --poll 0.3 3 waiter --mem 1G --duration 1m --reason t --pid $P2 -- true 2>/dev/null &
+RP=$!; sleep 1
+ls $T/gpu3 | grep -q waiter && ok "inline run waits in the queue" || bad "no waiter lock"
+kill -TERM $RP; wait $RP; RC=$?
+expect "SIGTERM while waiting -> 143" 143 $RC
+ls $T/gpu3 | grep -q waiter && bad "inline lock left after SIGTERM" || ok "lock it created is removed if stopped before starting"
+$G leave $B1 >/dev/null
+
 echo "== watch"
 K=$($G join 1 k --mem 1G --duration 1m --reason t --pid $P1 2>/dev/null)
 $G watch --all --poll 0.2 $K > $T/watch.out 2>&1 &
