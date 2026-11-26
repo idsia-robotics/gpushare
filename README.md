@@ -5,11 +5,11 @@
 Jobs wait for their turn instead of piling onto a busy GPU. Each GPU's owner gets it back on request. Everyone can see who is using what. Nothing runs in the background: it is just a shared folder of files.
 
 ```bash
-gpuq run 0 train          `# the GPU you want, and a name others will see in the queue` \
-  --mem 8G                `# so others know whether they can share the GPU with you` \
-  --duration 2h           `# so others know when the GPU will be free again` \
-  --reason "best effort"  `# so others can tell how much it would cost you to yield` \
-  -- python train.py      # runs once it's your turn, and frees the GPU when it exits
+gpuq run 0 train          `# GPU and job name, so others know what is waiting` \
+  --mem 8G                `# peak GPU memory, so others know if they can share` \
+  --duration 2h           `# expected run time, so others know when it frees up` \
+  --reason "best effort"  `# urgency, so others know what yielding would cost you` \
+  -- python train.py      # your job: runs on your turn, frees the GPU when it exits
 ```
 
 Agents (Claude Code, Codex, …) do this by themselves once you point them at [AGENTS.md](AGENTS.md).
