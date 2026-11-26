@@ -4,6 +4,8 @@
 !/.gitignore
 !/AGENTS.md
 !/README.md
+!/LICENSE
+!/docs/
 !/bin/
 !/setup.sh
 !/hosts/

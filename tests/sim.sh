@@ -30,6 +30,7 @@ expect "second is 1010" "1010-$USER-b" "$B"
 expect "third is 1020" "1020-$USER-c" "$C"
 expect "lock mode 666" "666" "$(stat -c %a $T/gpu4/$A)"
 grep -q '^assigned: yes' $T/gpu4/$A && ok "assigned detected from hosts json" || bad "assigned flag"
+$G status 4 | grep "$A" | grep -q '\[assigned user\]' && ok "status marks the assigned user (by file owner)" || bad "assigned mark"
 
 echo "== turn order"
 $G check $A >/dev/null; expect "A's turn" 0 $?
@@ -152,6 +153,12 @@ expect "renumber" "0500-$USER-multi" "$M2"
 OUT=$($G start $M2 2>/dev/null | tail -1)
 expect "multi-gpu env" "export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=GPU-fake-0,GPU-fake-1" "$OUT"
 $G leave $M2 >/dev/null
+
+echo "== identity comes from the file owner, not from names or headers"
+printf 'user: mallory\nassigned: yes\n--- log ---\n' > $T/gpu1/0500-mallory-fake; chmod 666 $T/gpu1/0500-mallory-fake
+$G status 1 | grep 0500-mallory-fake | grep -q "file owned by $USER" && ok "forged file name flagged" || bad "forged name not flagged"
+$G status 1 | grep 0500-mallory-fake | grep -q 'assigned user' && bad "forged 'assigned: yes' header trusted" || ok "header 'assigned: yes' not trusted"
+rm -f $T/gpu1/0500-mallory-fake
 
 echo "== isolation: planted module next to gpuq is not imported"
 D=$(mktemp -d); cp $G $D/gpuq; echo 'raise SystemExit("PLANTED json.py imported")' > $D/json.py

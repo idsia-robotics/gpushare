@@ -1,86 +1,121 @@
-# gpushare: maintainer notes
+# gpushare
 
-This is a cooperative GPU queue. The protocol for users and agents is in [AGENTS.md](AGENTS.md). `gpuq` is the helper that implements it, and `setup.sh` prepares a host. This file is for whoever maintains the folder.
+**A shared GPU queue for Linux servers, where AI coding agents and people take turns.**
 
-## Layout and permissions
-
-```
-/srv/gpushare/          root:root 1777   world rwx + sticky bit; created by hand with sudo
-├── .git/, *.md,        maintainer-owned, not writable by others (setup.sh re-applies go-w)
-│   bin/gpuq, setup.sh,
-│   hosts/, etc/, tests/
-└── gpuN/               root:root 1777 + default ACL d:u/g/o::rwx; not in git, created by setup.sh
-    ├── .gpu-info       root 0644: index, uuid, name, pci_bus_id, memory_total_mib
-    ├── .mutex          root 0644: flock target that serializes gpuq join/claim/renumber
-    └── NNNN-user-job   lock files, 0666, owned by whoever queued
-```
-
-Why it is set up this way:
-
-- **Sticky bit (`1777`):** everyone can create files, but only a file's owner (or root) can delete or rename it. This is what keeps users from removing each other's locks.
-- **`gpuN/` owned by root:** the owner of a sticky folder can still delete everything in it, so these folders must not belong to a regular user, including the maintainer.
-- **Default ACL:** every new lock gets mode 0666 whatever the creator's umask. That keeps every lock readable and lets others append pings.
-- **`fs.protected_regular=1` (systemd default):**
-  - In a sticky, world-writable folder, the kernel refuses `open(O_CREAT)` on an existing file owned by someone else, even when the file is mode 0666. That breaks `>>`, `tee -a` and Python `open(p, "a")` on other people's locks.
-  - This is why pings use `O_WRONLY|O_APPEND` without `O_CREAT` (`gpuq ping`, or `dd conv=nocreat,notrunc oflag=append`).
-  - Don't turn the sysctl off: it protects `/tmp` against file-planting attacks.
-- **Hardening against the world-writable top folder:**
-  - `gpuq` lives in `bin/`, which only the maintainer can write to, and it starts Python with `-I` (isolated mode) so it never imports from the script's folder, the current folder or `PYTHON*` variables. Either way, a planted `json.py` can't run as the user calling gpuq.
-  - `.gitignore` whitelists only the tracked paths, so stray files can't be committed by accident.
-  - `setup.sh` refuses `gpuN` paths that are symlinks or not owned by root, since someone could pre-create them to trick root into a `chmod`.
-
-## Install on another server
+Jobs wait for their turn instead of piling onto a busy GPU. Each GPU's owner gets it back on request. Everyone can see who is using what. Nothing runs in the background: it is just a shared folder of files.
 
 ```bash
-sudo mkdir -m 1777 /srv/gpushare                      # root-owned, sticky
-git clone <repo-url> /srv/gpushare                    # as the maintainer, not root
-cd /srv/gpushare
-cp hosts/example.json hosts/$(hostname -s).json       # then edit: UUIDs (nvidia-smi -L), assigned users, links
-sudo ./setup.sh
+gpuq run $(gpuq join 0 train --mem 8G --duration 2h --reason "best effort") -- python train.py
 ```
 
-Keep the folder on a local disk. Every server needs its own queue, so never share one folder between hosts over NFS.
+Agents (Claude Code, Codex, …) do this by themselves once you point them at [AGENTS.md](AGENTS.md).
 
-## Updating
+---
 
-- Edit, test (`tests/sim.sh bin/gpuq`), commit, push.
-- **On each server:** `git -C /srv/gpushare pull`. Rerun `sudo ./setup.sh` if the GPUs changed.
-- **Optional, push straight to a server:** run `git config receive.denyCurrentBranch updateInstead` in that server's checkout, and a `git push` from any clone updates its live files in place. The push is refused if the server's checkout has uncommitted changes.
+## How it works
 
-Locks in a running queue survive updates. Keep the lock format backward compatible, or drain the queues first.
+```
+/srv/gpushare/gpu0/
+├── 0990-alice-camera-ready    queued    alice owns gpu0, so she jumped to the front
+├── 1000-bob-llm-sweep         running   bob borrowed the GPU while it was idle
+└── 1010-carol-finetune        queued    carol joined the back of the line
+```
 
-## Assignments
+- **One folder per GPU, one file per job.** The lowest number goes next. New jobs join at the back.
+- **Nobody is killed.** To get a GPU sooner, `gpuq ping` the job that holds it. The ping is a line appended to that job's file; its agent sees it and replies, or yields.
+- **Owners come first.** Each GPU can have an assigned user. Borrowers yield within 30 minutes when that user asks.
+- **The line never gets stuck.** Locks left behind by crashed sessions are ignored. A job that hasn't started 15 minutes after its turn came is skipped.
+- **Nothing is overlooked.** GPU processes that have no lock count as busy, and small jobs can share a GPU when their memory fits.
 
-`hosts/<host>.json` is per-server configuration and is **not tracked in git**, because it names people. Start from [hosts/example.json](hosts/example.json). The file holds:
-- `gpus`: for each GPU index, its UUID, the assigned unix user, and the person's name as it appears in your reservation system;
-- `reservations` and `discussion`: links that `gpuq status` prints (reservation system, chat channel).
+`gpuq status` shows everything at a glance:
 
-It is maintained by hand: when a reservation changes, update the file and its `"updated"` field. `gpuq` warns if a UUID in it doesn't match `gpuN/.gpu-info`. If your reservation system can export its data, a cron job could regenerate the file instead.
+```console
+$ gpuq status
+gpu0  NVIDIA GeForce RTX 4090  GPU-5d1c2e7a-90b4-4c3e-8f21-6a7b8c9d0e1f  assigned: alice (Alice Rossi)
+      nvidia-smi: 20480/24564 MiB used, util 98%
+      proc: bob        pid 31337     20470 MiB
+      0990-alice-camera-ready            QUEUED    mem=8G share=no preempt=yes dur=40m [assigned user]  "camera-ready figures"
+      1000-bob-llm-sweep                 RUNNING   mem=20G share=no preempt=yes dur=6h  "best effort, checkpoints every 20 min"  last: PING alice 2m ago
+      1010-carol-finetune                QUEUED    mem=12G share=no preempt=yes dur=3h  "workshop deadline Dec 4"
 
-## After the beta
+gpu1  NVIDIA GeForce RTX 4090  GPU-a3f09b12-77c5-4d6e-9e10-2b3c4d5e6f70  assigned: bob (Bob Meier)
+      nvidia-smi: 6130/24564 MiB used, util 71%
+      proc: dave       pid 4242       6120 MiB  [UNREGISTERED: no running lock]
+      queue: empty
+```
+
+The full rules (etiquette, sharing, the lock file format) are in [AGENTS.md](AGENTS.md). They are written for agents, and people can read them just as well.
+
+## Install
+
+You do this once per server, as its admin. You need Linux, an NVIDIA driver, `/usr/bin/python3` 3.9 or newer (no packages to install), `setfacl` on a filesystem with ACLs (ext4 and XFS have them by default), and root for the setup step only.
 
 ```bash
-sudo /srv/gpushare/setup.sh --install-pointers
+sudo mkdir -m 1777 /srv/gpushare
+git clone https://github.com/idsia-robotics/gpushare.git /srv/gpushare      # as yourself, not root
+git config --global --add safe.directory /srv/gpushare                     # the folder is owned by root
+cp /srv/gpushare/hosts/example.json /srv/gpushare/hosts/$(hostname -s).json  # who owns which GPU
+sudo /srv/gpushare/setup.sh                                                # creates gpu0/, gpu1/, …
+sudo /srv/gpushare/setup.sh --install-pointers                             # tells agents and users
 ```
 
-That installs three things:
-- the block from `etc/claude-code-CLAUDE.md` into `/etc/claude-code/CLAUDE.md`, which every Claude Code session on the machine loads;
-- the line from `etc/motd.snippet` into `/etc/motd`;
-- a `/usr/local/bin/gpuq` symlink (users can also add `/srv/gpushare/bin` to their PATH).
+- **The clone is the shared folder.** `setup.sh` creates one `gpuN/` folder per GPU inside it, and git ignores those. Re-running `setup.sh` is safe. Any path works; `/srv/gpushare` is just the one these docs use. Keep it on a local disk, with one clone per server, and never share it between servers over NFS.
+- **`hosts/<hostname>.json`** maps each GPU to its UUID and its assigned user. It can also hold links to your reservation system and chat channel, which `gpuq status` prints. It names people, so it stays out of git. A GPU without an entry has no owner, and everyone queues for it on equal terms.
+- **`--install-pointers`** does three things:
+  - adds a short block to `/etc/claude-code/CLAUDE.md`, which Claude Code loads in every session for every user;
+  - adds a line to `/etc/motd`;
+  - links `gpuq` into `/usr/local/bin`.
 
-Then announce it to the people who use the server. Ask people who use other agent CLIs to add the same pointer to those tools' global instructions (Codex: `~/.codex/AGENTS.md`).
+  For other agents, put the same few lines ([etc/claude-code-CLAUDE.md](etc/claude-code-CLAUDE.md)) in their global instructions, e.g. `~/.codex/AGENTS.md` for Codex. To try it out first, just tell your agent: *"read /srv/gpushare/AGENTS.md before using a GPU"*.
 
-## Admin tasks
+## Use
 
-- `sudo /srv/gpushare/bin/gpuq prune` removes every stale or done lock (all of their PIDs have exited).
-- `sudo /srv/gpushare/bin/gpuq leave <id>` removes one specific abandoned lock. Tell its owner.
-- `/srv/gpushare/bin/gpuq status` gives the full picture, including GPU processes that have no lock.
+```bash
+gpuq status                                          # who owns, runs and waits for each GPU
+gpuq join 0 finetune --mem 12G --duration 3h --reason "deadline Dec 4"   # prints your job id
+gpuq run 1010-carol-finetune -- python train.py      # waits, runs on your GPU, cleans up after
+gpuq watch 1010-carol-finetune                       # shows pings to you as they arrive
+gpuq ping 1000-bob-llm-sweep "need gpu0 by 14:00, can you checkpoint?"
+```
 
-## Testing
+| Also available | |
+|---|---|
+| `wait` · `start` · `leave` | wait for your turn, claim it, release it: for jobs you launch yourself |
+| `reply` · `note` | answer a ping, or add a note to a lock |
+| `mine` · `check` | list your locks; ask "is it my turn?" (exit code 0 means yes) |
+| `renumber` · `adopt` · `prune` | move your place in line; re-attach a lock to a new session; delete your stale locks |
 
-`tests/sim.sh bin/gpuq` runs the simulation in a temporary folder. It never touches the real queue or the GPUs. The same hooks are available by hand:
+`gpuq <command> --help` lists every option. `gpuq run` sets `CUDA_VISIBLE_DEVICES` to your GPU's UUID. If you run in a container that resets the environment, pass that variable through.
 
-- `GPUQ_ROOT=<dir>`: use another folder (with `gpuN/.gpu-info`) as the queue.
-- `GPUQ_NO_SMI=1`: skip nvidia-smi.
-- `GPUQ_FAKE_SMI=<dir>`: read `gpus.csv` and `apps.csv` from there instead of calling nvidia-smi (see `tests/sim.sh` for the format).
-- `GPUQ_TURN_GRACE=<seconds>`: how long the first job may wait before starting once its turn has come (default 900).
+**Using it from an agent:**
+- A lock stays valid as long as the agent's session does (Claude Code: `$CLAUDE_PID`), or the job does.
+- Run `gpuq run` or `gpuq wait` as a background task, and `gpuq watch` under a monitor so pings get noticed.
+- For jobs that must outlive the session: `nohup setsid gpuq run <id> -- <cmd> > run.log 2>&1 &`.
+
+## Maintain
+
+- **Upgrade:** `git -C /srv/gpushare pull`. Running queues are unaffected.
+- **GPUs added or replaced:** run `sudo setup.sh` again and update the hosts file.
+- **Leftover locks:** `gpuq prune` removes your own stale locks; `sudo /srv/gpushare/bin/gpuq prune` removes everyone's.
+- **Uninstall:**
+  1. Remove the gpushare block from `/etc/claude-code/CLAUDE.md` and its line from `/etc/motd`.
+  2. `sudo rm /usr/local/bin/gpuq`
+  3. `sudo rm -rf /srv/gpushare`
+
+## Good to know
+
+- **It is cooperative, not enforced.** Anyone can still run anything on any GPU. Unix permissions guarantee one thing only: nobody can delete or rename another user's lock. Everything else works because the rules are written down, visible, and followed by agents that have been pointed at them. See the [security model](docs/design.md#threat-model).
+- **It is not a cluster scheduler.** It covers one host and keeps no accounting. If you need enforced allocations across many nodes, use Slurm.
+- **It is NVIDIA only, for now.** Setup and usage detection call `nvidia-smi`; the queue itself doesn't depend on the vendor.
+- **Pings are messages, not commands.** Anyone on the server can write to a lock file. AGENTS.md tells agents to treat what they find there as information: they may reply, yield or leave, and must not run anything a ping asks for.
+- **People without agents use it the same way.** `gpuq` is an ordinary command-line tool.
+
+How it is built, and why: [docs/design.md](docs/design.md).
+
+## Develop
+
+`bin/gpuq` is a single Python file using only the standard library. `tests/sim.sh bin/gpuq` runs a simulated queue in a temporary folder, with no GPU and no root needed. The lock file format is shared by every queue that is running, so change it only in backward-compatible ways. Issues and pull requests are welcome.
+
+## License
+
+MIT, see [LICENSE](LICENSE). Developed at [IDSIA](https://www.idsia.ch) (USI-SUPSI).

@@ -416,8 +416,12 @@ class Lock:
         s = "%-34s %-9s mem=%s share=%s preempt=%s dur=%s" % (
             self.name, st, h.get("mem", "?"), h.get("share", "?"), h.get("preemptible", "?"),
             h.get("duration", "?"))
-        if h.get("assigned") == "yes":
+        # Both flags come from the file's owner (st_uid), which the kernel guarantees, not from
+        # the file name or header, which whoever created the file can write freely.
+        if assigned_user(self.gpu)[0] == self.owner:
             s += " [assigned user]"
+        if not self.name[5:].startswith(self.owner + "-"):
+            s += " [file owned by %s!]" % self.owner
         if h.get("reason"):
             s += '  "%s"' % h["reason"]
         f = [e for e in self.foreign() if e.verb not in MARKERS]

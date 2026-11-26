@@ -27,8 +27,8 @@ done
 chmod 1777 "$ROOT"
 
 # Tracked files and .git must not be writable by others.
-chmod -R go-w "$ROOT/.git" "$ROOT/bin" "$ROOT/hosts" "$ROOT/etc" "$ROOT/tests" 2>/dev/null || true
-for f in AGENTS.md README.md setup.sh .gitignore; do
+chmod -R go-w "$ROOT/.git" "$ROOT/bin" "$ROOT/docs" "$ROOT/hosts" "$ROOT/etc" "$ROOT/tests" 2>/dev/null || true
+for f in AGENTS.md README.md LICENSE setup.sh .gitignore; do
   if [[ -e "$ROOT/$f" ]]; then chmod go-w "$ROOT/$f"; fi
 done
 
