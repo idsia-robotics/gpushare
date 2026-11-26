@@ -1,7 +1,8 @@
 #!/usr/bin/python3 -I
-# -I (isolated mode): never import modules from the script's directory, the current
-# directory or PYTHON* variables. The queue's top folder is world-writable, so planted
-# modules must never get a chance to run as the user calling gpuq.
+# -I (isolated mode): ignore PYTHON* variables and user site-packages, and don't import
+# from the script's folder. bin/ is not writable by others, so this is defence in depth:
+# it keeps the shared tool's behaviour independent of each user's Python setup, and
+# keeps copies of gpuq safe even if they end up in a world-writable folder.
 """gpuq - cooperative GPU queue helper. The protocol is defined in AGENTS.md next to
 this file; gpuq only implements it. Python >= 3.9, standard library only."""
 

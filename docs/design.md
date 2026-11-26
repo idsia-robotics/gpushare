@@ -48,7 +48,7 @@ The cost is the lack of transactions. Every change is either an atomic append or
   - That's why `gpuq` appends with `O_WRONLY|O_APPEND` and no `O_CREAT`; by hand, use `dd conv=nocreat,notrunc oflag=append`.
   - Leave the sysctl on: it protects `/tmp` against file-planting attacks.
 - **Hardening the world-writable top folder:**
-  - `bin/` is writable only by the maintainer, and `gpuq` runs Python with `-I` (isolated mode), so it never imports modules from the script's folder, the current folder or `PYTHON*` variables;
+  - `bin/` is writable only by the maintainer, so nobody can plant a module next to `gpuq`. As defence in depth, `gpuq` also runs Python with `-I` (isolated mode): it ignores `PYTHON*` variables and user site-packages, and doesn't import from the script's folder. That keeps the shared tool's behaviour independent of each user's Python setup, and keeps copies of `gpuq` safe even if they end up in a world-writable folder;
   - `.gitignore` whitelists the tracked paths, so stray files never get committed;
   - `setup.sh` runs as root, so it refuses `gpuN` paths that are symlinks or are not owned by root, and it writes its own files through `mktemp` + `mv`.
 
