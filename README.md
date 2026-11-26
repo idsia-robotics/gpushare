@@ -60,7 +60,7 @@ sudo /srv/gpushare/setup.sh --install-pointers                             # tel
 ```
 
 - **The clone is the shared folder.** `setup.sh` creates one `gpuN/` folder per GPU inside it, and git ignores those. Re-running `setup.sh` is safe. Any path works; `/srv/gpushare` is just the one these docs use. Keep it on a local disk, with one clone per server, and never share it between servers over NFS.
-- **`hosts/<hostname>.json`** maps each GPU to its UUID and its assigned user. It can also hold links to your reservation system and chat channel, which `gpuq status` prints. It names people, so it stays out of git. A GPU without an entry has no owner, and everyone queues for it on equal terms.
+- **`hosts/<hostname>.json`** maps each GPU to its UUID and its assigned user. It can also hold a link to your reservation system, which `gpuq status` prints. It names people, so it stays out of git. A GPU without an entry has no owner, and everyone queues for it on equal terms.
 - **`--install-pointers`** does three things:
   - adds a short block to `/etc/claude-code/CLAUDE.md`, which Claude Code loads in every session for every user;
   - adds a line to `/etc/motd`;

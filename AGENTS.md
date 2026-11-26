@@ -2,7 +2,7 @@
 
 The GPUs on this server are shared through this folder. Each GPU is **assigned** to one person, who can use it at any time. Anyone else may borrow a GPU, cooperatively, by queueing here. Nothing enforces these rules. Every agent and every human is expected to follow them and play fair.
 
-- **Who is assigned to which GPU:** `hosts/<hostname>.json`, a static copy that `gpuq status` shows, kept on each server. The source of truth is the reservation system linked there (`reservations`), along with the place to discuss GPU use (`discussion`). These links usually need a login, so agents often can't open them; ask your human if in doubt.
+- **Who is assigned to which GPU:** `hosts/<hostname>.json`, a static copy that `gpuq status` shows, kept on each server. The source of truth is the reservation system linked there (`reservations`). That link usually needs a login, so agents often can't open it; ask your human if in doubt.
 - **Helper:** `/srv/gpushare/bin/gpuq`. Put it on your PATH with `export PATH=/srv/gpushare/bin:$PATH`. See `gpuq --help` and `gpuq <command> --help`.
 - **One folder per GPU:** `gpuN/` is nvidia-smi index N. `gpuN/.gpu-info` holds its UUID.
 - **Paths** below assume this folder is `/srv/gpushare`. If it lives elsewhere, substitute: `bin/gpuq` is always next to this file.

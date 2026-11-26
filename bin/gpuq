@@ -698,11 +698,8 @@ def cmd_status(a):
     cfg = host_config()
     if not cfg:
         print("(no hosts/%s.json: assigned users unknown; ask your human)\n" % HOST)
-    for key in ("reservations", "discussion"):
-        if cfg.get(key):
-            print("%s: %s" % (key, cfg[key]))
-    if cfg.get("reservations") or cfg.get("discussion"):
-        print()
+    if cfg.get("reservations"):
+        print("reservations: %s\n" % cfg["reservations"])
     for g in gpus:
         au, an = assigned_user(g)
         print("gpu%d  %s  %s  assigned: %s" % (

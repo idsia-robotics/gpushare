@@ -1,7 +1,6 @@
 {
   "host": "gpubox",
   "reservations": "https://example.org/gpu-reservations (source of truth for who is assigned to which GPU)",
-  "discussion": "https://example.org/chat/gpu-channel",
   "updated": "2026-01-01",
   "note": "Copy to hosts/<hostname -s>.json on each server. That file is not tracked in git because it names people. If it disagrees with the reservation system, the reservation system wins.",
   "gpus": {
