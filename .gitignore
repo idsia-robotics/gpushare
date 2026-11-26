@@ -1,0 +1,14 @@
+# The top folder is world-writable: ignore everything except the files we track,
+# so stray files from other users are never committed by accident.
+/*
+!/.gitignore
+!/AGENTS.md
+!/README.md
+!/bin/
+!/setup.sh
+!/hosts/
+/hosts/*
+!/hosts/example.json
+!/etc/
+!/tests/
+__pycache__/

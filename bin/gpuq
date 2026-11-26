@@ -1,0 +1,1192 @@
+#!/usr/bin/python3 -I
+# -I (isolated mode): never import modules from the script's directory, the current
+# directory or PYTHON* variables. The queue's top folder is world-writable, so planted
+# modules must never get a chance to run as the user calling gpuq.
+"""gpuq - cooperative GPU queue helper. The protocol is defined in AGENTS.md next to
+this file; gpuq only implements it. Python >= 3.9, standard library only."""
+
+import argparse
+import datetime as dt
+import errno
+import fcntl
+import json
+import os
+import pwd
+import re
+import signal
+import socket
+import stat
+import subprocess
+import sys
+import threading
+import time
+
+ROOT = os.path.realpath(os.environ.get("GPUQ_ROOT") or
+                        os.path.dirname(os.path.dirname(os.path.realpath(__file__))))  # <root>/bin/gpuq
+HOST = socket.gethostname().split(".")[0]
+USER = pwd.getpwuid(os.getuid()).pw_name
+ME = USER + "@" + HOST
+IS_ROOT = os.getuid() == 0
+NO_SMI = os.environ.get("GPUQ_NO_SMI") == "1"
+FAKE_SMI = os.environ.get("GPUQ_FAKE_SMI")  # test hook: dir with gpus.csv / apps.csv
+
+LOCK_RE = re.compile(r"^(\d{4})-([a-z0-9][a-z0-9._-]*)$")
+GPU_DIR_RE = re.compile(r"^gpu(\d+)$")
+ENTRY_RE = re.compile(r"^(\d{4}-\d\d-\d\dT\S+) (\S+@\S+) ([A-Z]+)(?: (.*))?$")
+HEADER_RE = re.compile(r"^([a-z_]+):\s?(.*)$")
+LOG_MARK = "--- log (append-only: gpuq ping/reply/note, or dd; see AGENTS.md) ---"
+HEADROOM_MIB = 1024
+TURN_GRACE = float(os.environ.get("GPUQ_TURN_GRACE", "900"))  # seconds to start once it's your turn
+MARKERS = ("TURN", "NOTURN", "SKIP")  # written by observers, not by people
+SHELLS = {"bash", "sh", "zsh", "dash", "fish", "ksh", "tcsh", "csh", "sudo", "env", "timeout",
+          "nohup", "setsid", "script", "time", "xargs", "stdbuf", "flock", "gpuq"}
+
+
+# ----------------------------------------------------------------------------- utils
+
+def now():
+    return dt.datetime.now().astimezone()
+
+
+def now_iso():
+    return now().isoformat(timespec="seconds")
+
+
+def hhmm():
+    return now().strftime("%H:%M:%S")
+
+
+def parse_iso(s):
+    try:
+        return dt.datetime.fromisoformat(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def ago(ts):
+    t = parse_iso(ts) if isinstance(ts, str) else ts
+    if t is None:
+        return "?"
+    s = int((now() - t).total_seconds())
+    if s < 90:
+        return "%ds ago" % s
+    if s < 5400:
+        return "%dm ago" % (s // 60)
+    if s < 172800:
+        return "%.1fh ago" % (s / 3600)
+    return "%dd ago" % (s // 86400)
+
+
+def die(msg, code=2):
+    print("gpuq: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def warn(msg):
+    print("gpuq: warning: " + msg, file=sys.stderr)
+
+
+def uname(uid):
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return str(uid)
+
+
+def yes(v):
+    return str(v).strip().lower() in ("yes", "y", "true", "1")
+
+
+def parse_mem(v):
+    """'10G', '10GB', '512M', '16000MiB', '10' (GB) -> MiB; None if unknown."""
+    if v is None:
+        return None
+    m = re.match(r"^\s*([\d.]+)\s*([gGmM]?)(?:i?[bB])?\s*$", str(v))
+    if not m:
+        return None
+    n = float(m.group(1))
+    return int(n if m.group(2).lower() == "m" else n * 1024)
+
+
+def fmt_mib(m):
+    return "?" if m is None else ("%.1fG" % (m / 1024)).replace(".0G", "G")
+
+
+def sanitize_job(s):
+    s = re.sub(r"[^a-z0-9._-]+", "-", s.lower()).strip("-._")
+    return s[:40] or "job"
+
+
+# ----------------------------------------------------------------------------- processes
+
+def _stat_fields(pid):
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            return f.read().rsplit(")", 1)[1].split()
+    except (OSError, IndexError):
+        return None
+
+
+def proc_start(pid):
+    f = _stat_fields(pid)
+    try:
+        return int(f[19]) if f else None  # field 22 (starttime); f[0] is field 3
+    except (ValueError, IndexError):
+        return None
+
+
+def proc_ppid(pid):
+    f = _stat_fields(pid)
+    try:
+        return int(f[1]) if f else 0
+    except (ValueError, IndexError):
+        return 0
+
+
+def proc_comm(pid):
+    try:
+        with open("/proc/%d/comm" % pid) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def pid_alive(pid, start=None):
+    s = proc_start(pid)
+    return s is not None and (start is None or s == start)
+
+
+def detect_owner_pid():
+    """Long-lived process that represents this session: $CLAUDE_PID for Claude Code,
+    otherwise the first ancestor that is not a shell (agent CLI, sshd session, tmux...)."""
+    cp = os.environ.get("CLAUDE_PID", "")
+    if cp.isdigit() and pid_alive(int(cp)):
+        return int(cp)
+    pid, hops = os.getppid(), 0
+    while pid > 1 and hops < 64:
+        comm = proc_comm(pid)
+        if comm is None:
+            break
+        if comm not in SHELLS:
+            return pid
+        pid, hops = proc_ppid(pid), hops + 1
+    return os.getppid()
+
+
+# ----------------------------------------------------------------------------- gpus
+
+class Gpu:
+    def __init__(self, index, path):
+        self.index = index
+        self.dir = path
+        self.info = read_kv(os.path.join(path, ".gpu-info"))
+        self.uuid = self.info.get("uuid")
+        self.name = self.info.get("name", "?")
+        self.total = parse_mem((self.info.get("memory_total_mib") or "") + "M")
+
+
+def read_kv(path):
+    d = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                if ":" in line and not line.startswith("#"):
+                    k, v = line.split(":", 1)
+                    d[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return d
+
+
+def list_gpus():
+    out = []
+    try:
+        entries = os.listdir(ROOT)
+    except OSError as e:
+        die("cannot read %s: %s" % (ROOT, e))
+    for e in entries:
+        m = GPU_DIR_RE.match(e)
+        p = os.path.join(ROOT, e)
+        if m and os.path.isdir(p) and not os.path.islink(p):
+            out.append(Gpu(int(m.group(1)), p))
+    if not out:
+        die("no gpuN/ folders in %s (run: sudo %s/setup.sh)" % (ROOT, ROOT))
+    return sorted(out, key=lambda g: g.index)
+
+
+def resolve_gpus(spec):
+    gpus = {g.index: g for g in list_gpus()}
+    out = []
+    for part in str(spec).replace("gpu", "").split(","):
+        part = part.strip()
+        if not part.isdigit() or int(part) not in gpus:
+            die("unknown GPU %r (have: %s)" % (part, ",".join(str(i) for i in sorted(gpus))))
+        if gpus[int(part)] not in out:
+            out.append(gpus[int(part)])
+    return out
+
+
+_host_cache = None
+
+
+def host_config():
+    """hosts/<host>.json: assignments plus links (local to each server, not in git)."""
+    global _host_cache
+    if _host_cache is None:
+        path = os.path.join(ROOT, "hosts", HOST + ".json")
+        try:
+            with open(path) as f:
+                _host_cache = json.load(f)
+        except FileNotFoundError:
+            _host_cache = {}
+        except (OSError, ValueError) as e:
+            warn("cannot read %s: %s" % (path, e))
+            _host_cache = {}
+    return _host_cache
+
+
+def assignments():
+    return host_config().get("gpus", {})
+
+
+def assigned_user(gpu):
+    a = assignments().get(str(gpu.index)) or {}
+    if a.get("uuid") and gpu.uuid and a["uuid"] != gpu.uuid:
+        warn("hosts/%s.json says gpu%d is %s but .gpu-info says %s" % (HOST, gpu.index, a["uuid"], gpu.uuid))
+    return a.get("assigned"), a.get("name")
+
+
+_smi_warned = False
+
+
+def query_smi():
+    """{uuid: {index,total,used,util,procs:[(pid,user,mib)]}} or None if unavailable."""
+    global _smi_warned
+    if NO_SMI:
+        return None
+
+    def run(args, fake):
+        if FAKE_SMI:
+            with open(os.path.join(FAKE_SMI, fake)) as f:
+                return f.read()
+        return subprocess.run(["nvidia-smi"] + args + ["--format=csv,noheader,nounits"],
+                              capture_output=True, text=True, check=True, timeout=30).stdout
+
+    def num(x):
+        try:
+            return int(float(x))
+        except ValueError:
+            return None
+
+    try:
+        gtxt = run(["--query-gpu=index,uuid,memory.total,memory.used,utilization.gpu"], "gpus.csv")
+        atxt = run(["--query-compute-apps=gpu_uuid,pid,used_memory"], "apps.csv")
+    except (OSError, subprocess.SubprocessError) as e:
+        if not _smi_warned:
+            warn("nvidia-smi unavailable (%s); skipping the unregistered-usage check" % e)
+            _smi_warned = True
+        return None
+    out = {}
+    for line in gtxt.splitlines():
+        p = [x.strip() for x in line.split(",")]
+        if len(p) >= 5:
+            out[p[1]] = {"index": num(p[0]), "total": num(p[2]), "used": num(p[3]),
+                         "util": num(p[4]), "procs": []}
+    for line in atxt.splitlines():
+        p = [x.strip() for x in line.split(",")]
+        if len(p) >= 3 and p[0] in out and p[1].isdigit():
+            pid = int(p[1])
+            if len(p) >= 4:
+                user = p[3]  # fake files may name the user
+            else:
+                try:
+                    user = uname(os.stat("/proc/%d" % pid).st_uid)
+                except OSError:
+                    user = "?"
+            out[p[0]]["procs"].append((pid, user, num(p[2])))
+    return out
+
+
+# ----------------------------------------------------------------------------- locks
+
+class Entry:
+    def __init__(self, ts, who, verb, rest):
+        self.ts, self.who, self.verb, self.rest = ts, who, verb, rest or ""
+        self.user = who.split("@", 1)[0]
+
+    def line(self):
+        return "%s %s %s%s" % (self.ts, self.who, self.verb, (" " + self.rest) if self.rest else "")
+
+
+class Lock:
+    def __init__(self, gpu, name):
+        self.gpu, self.name = gpu, name
+        self.path = os.path.join(gpu.dir, name)
+        self.number = int(name[:4])
+        st = os.lstat(self.path)
+        self.ino = (st.st_dev, st.st_ino)
+        self.owner = uname(st.st_uid)
+        self.header, self.log, self.readable = {}, [], True
+        try:
+            with open(self.path, encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except PermissionError:
+            self.readable, text = False, ""
+        for line in text.splitlines():
+            m = ENTRY_RE.match(line)
+            if m:
+                self.log.append(Entry(*m.groups()))
+                continue
+            h = HEADER_RE.match(line)
+            if h and not self.log and h.group(1) not in self.header:
+                self.header[h.group(1)] = h.group(2).strip()
+        own = [e for e in self.log if e.user == self.owner]
+        self.state = "queued"
+        self.pids = []
+        if self.header.get("owner_pid", "").isdigit():
+            s = self.header.get("owner_pid_start", "")
+            self.pids.append((int(self.header["owner_pid"]), int(s) if s.isdigit() else None))
+        for e in own:
+            if e.verb == "STATUS":
+                word = (e.rest.split() or ["queued"])[0].lower()
+                if word in ("queued", "running", "done"):
+                    self.state = word
+                m = re.search(r"pid=(\d+)(?: start=(\d+))?", e.rest)
+                if m:
+                    self.pids.append((int(m.group(1)), int(m.group(2)) if m.group(2) else None))
+            elif e.verb == "PID":
+                m = re.match(r"(\d+)(?:\s+(\d+))?", e.rest)
+                if m:
+                    self.pids.append((int(m.group(1)), int(m.group(2)) if m.group(2) else None))
+        self.host = self.header.get("host")
+        self.mem = parse_mem(self.header.get("mem"))
+        self.share = yes(self.header.get("share", "no"))
+        self.created = parse_iso(self.header.get("created"))
+        self.flag = ""
+        if self.state == "done":
+            self.valid, self.flag = False, "done"
+        elif not self.readable:
+            self.valid, self.flag = True, "unreadable"
+        elif self.host and self.host != HOST:
+            self.valid, self.flag = True, "other-host"
+        elif not self.pids:
+            self.valid, self.flag = True, "no-pid"
+        else:
+            self.valid = any(pid_alive(p, s) for p, s in self.pids)
+            if not self.valid:
+                self.flag = "stale"
+
+    def key(self):
+        c = self.created.timestamp() if self.created else float("inf")
+        return (self.number, c, self.name)
+
+    def foreign(self):
+        return [e for e in self.log if e.user != self.owner]
+
+    def skipped(self):
+        """Passed over as a no-show: a SKIP after the owner's last real activity."""
+        last = -1
+        for i, e in enumerate(self.log):
+            if e.user == self.owner and e.verb not in MARKERS:
+                last = i
+        return any(e.verb == "SKIP" for e in self.log[last + 1:])
+
+    def turn_since(self):
+        """When the current TURN streak began (datetime), or None."""
+        since = None
+        for e in self.log:
+            if e.verb == "TURN":
+                if since is None:
+                    since = parse_iso(e.ts)
+            elif e.verb in ("NOTURN", "SKIP") or (e.user == self.owner and e.verb == "STATUS"):
+                since = None
+        return since
+
+    def summary(self):
+        h = self.header
+        st = self.state.upper() if self.valid else (self.flag or self.state).upper()
+        if self.valid and self.flag:
+            st += "(" + self.flag + ")"
+        turn = ""
+        if self.valid and self.state == "queued":
+            if self.skipped():
+                st = "SKIPPED"
+            elif self.turn_since():
+                turn = "  its turn since %s" % ago(self.turn_since())
+        s = "%-34s %-9s mem=%s share=%s preempt=%s dur=%s" % (
+            self.name, st, h.get("mem", "?"), h.get("share", "?"), h.get("preemptible", "?"),
+            h.get("duration", "?"))
+        if h.get("assigned") == "yes":
+            s += " [assigned user]"
+        if h.get("reason"):
+            s += '  "%s"' % h["reason"]
+        f = [e for e in self.foreign() if e.verb not in MARKERS]
+        if f:
+            s += "  last: %s %s %s" % (f[-1].verb, f[-1].user, ago(f[-1].ts))
+        return s + turn
+
+
+def scan(gpu):
+    out = []
+    try:
+        names = os.listdir(gpu.dir)
+    except OSError:
+        return out
+    for n in names:
+        if not LOCK_RE.match(n):
+            continue
+        try:
+            if not stat.S_ISREG(os.lstat(os.path.join(gpu.dir, n)).st_mode):
+                continue
+            out.append(Lock(gpu, n))
+        except FileNotFoundError:
+            continue
+    return sorted(out, key=Lock.key)
+
+
+def find_job(ident, gpus=None):
+    """All lock files of one job (one per GPU). ident: id, path, or unique substring."""
+    gpus = gpus or list_gpus()
+    name = os.path.basename(ident.rstrip("/"))
+    found = []
+    for g in gpus:
+        p = os.path.join(g.dir, name)
+        if LOCK_RE.match(name) and os.path.lexists(p):
+            try:
+                found.append(Lock(g, name))
+            except FileNotFoundError:
+                pass
+    if found:
+        return found
+    cands = sorted({l.name for g in gpus for l in scan(g) if name in l.name})
+    if len(cands) == 1:
+        return find_job(cands[0], gpus)
+    if cands:
+        die("%r is ambiguous: %s" % (ident, ", ".join(cands)))
+    die("no lock named %r (see: gpuq mine / gpuq status)" % ident, 3)
+
+
+def require_owner(locks):
+    for l in locks:
+        if l.owner != USER and not IS_ROOT:
+            die("%s belongs to %s; you can only ping it (gpuq ping)" % (l.path, l.owner))
+
+
+def append_line(path, verb, msg=""):
+    """Append one log line. Deliberately WITHOUT O_CREAT: with fs.protected_regular=1 the
+    kernel refuses O_CREAT opens of other users' files in sticky world-writable dirs,
+    so `>>`, `tee -a` and open(p, 'a') fail on someone else's lock. Plain O_APPEND works."""
+    msg = " ".join(str(msg).split())
+    line = "%s %s %s%s\n" % (now_iso(), ME, verb, (" " + msg) if msg else "")
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND)
+    try:
+        os.write(fd, line.encode("utf-8"))
+    finally:
+        os.close(fd)
+
+
+class Mutex:
+    """Serialises join/claim/renumber per GPU dir via flock on gpuN/.mutex."""
+
+    def __init__(self, gpus, timeout=60):
+        self.dirs = sorted({g.dir for g in gpus})
+        self.timeout = timeout
+        self.fds = []
+
+    @staticmethod
+    def _open(d):
+        p = os.path.join(d, ".mutex")
+        try:
+            return os.open(p, os.O_RDONLY)
+        except FileNotFoundError:
+            try:
+                return os.open(p, os.O_RDONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            except FileExistsError:
+                return os.open(p, os.O_RDONLY)
+
+    def __enter__(self):
+        for d in self.dirs:
+            fd = self._open(d)
+            deadline = time.time() + self.timeout
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError as e:
+                    if e.errno not in (errno.EAGAIN, errno.EACCES) or time.time() > deadline:
+                        os.close(fd)
+                        self.__exit__()
+                        die("could not lock %s/.mutex (held by someone for >%ds?)" % (d, self.timeout))
+                    time.sleep(0.1)
+            self.fds.append(fd)
+        return self
+
+    def __exit__(self, *a):
+        for fd in reversed(self.fds):
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+        self.fds = []
+
+
+# ----------------------------------------------------------------------------- turn logic
+
+def evaluate_one(me, locks, smi, skipped, ignore_unregistered=False):
+    """Is it `me`'s turn on its GPU, given that GPU's current locks? -> (ok, mode, reason)"""
+    g = me.gpu
+    tag = "gpu%d: " % g.index
+    active = [l for l in locks if l.name != me.name and l.valid]
+    running = [l for l in active if l.state == "running"]
+    ahead = [l for l in active if l.state == "queued" and l.name not in skipped and l.key() < me.key()]
+    if ahead:
+        return False, None, tag + "behind " + ", ".join(l.name for l in ahead)
+    info = smi.get(g.uuid) if (smi and g.uuid) else None
+    owners = {l.owner for l in running}
+    unreg = [p for p in info["procs"] if p[1] not in owners] if info else []
+    if unreg and not ignore_unregistered:
+        return False, None, (tag + "unregistered usage (no lock): " + ", ".join(
+            "%s pid %d %sMiB" % (u, pid, m) for pid, u, m in unreg)
+            + " -- ask them, or the assigned user, before using --ignore-unregistered")
+    if not running and not unreg:
+        return True, "exclusive", None
+    if running:
+        if not me.share:
+            return False, None, tag + "busy: " + ", ".join(l.name for l in running) + " running"
+        ns = [l.name for l in running if not l.share]
+        if ns:
+            return False, None, tag + "busy: " + ", ".join(ns) + " running (not shareable)"
+        if me.mem is None or any(l.mem is None for l in running):
+            return False, None, tag + "cannot share: some job did not declare mem"
+        total = g.total or (info and info["total"]) or 0
+        used = sum(l.mem for l in running)
+        if used + me.mem > total - HEADROOM_MIB:
+            return False, None, tag + "cannot share: declared %s + yours %s > %s budget" % (
+                fmt_mib(used), fmt_mib(me.mem), fmt_mib(total - HEADROOM_MIB))
+    if info and info["total"] is not None and info["used"] is not None:
+        if me.mem is None:
+            return False, None, tag + "cannot share: declare --mem"
+        if info["total"] - info["used"] - HEADROOM_MIB < me.mem:
+            return False, None, tag + "cannot share: nvidia-smi shows only %s free (+1G headroom)" % fmt_mib(
+                info["total"] - info["used"])
+    return True, "shared", None
+
+
+def mark(lock, verb, msg=""):
+    try:
+        append_line(lock.path, verb, msg)
+    except OSError:
+        pass  # hand-made lock without o+w: can't mark it
+
+
+def turn_pass(g, smi):
+    """Observe one GPU's queue and record turns (run by every waiting gpuq).
+    The first queued job whose turn it is gets a TURN line. If it still hasn't started
+    TURN_GRACE seconds later, it gets a SKIP line and the jobs behind it may go first;
+    it keeps its number and rejoins as soon as its owner runs gpuq wait/run/start/check
+    again. Returns (locks, names of skipped locks)."""
+    locks = scan(g)
+    skipped = {l.name for l in locks if l.valid and l.state == "queued" and l.skipped()}
+    for l in locks:  # sorted by queue order, so earlier skips count for later jobs
+        if not l.valid or l.state != "queued" or l.name in skipped:
+            continue
+        ok = evaluate_one(l, locks, smi, skipped)[0]
+        since = l.turn_since()
+        if ok and since is None:
+            mark(l, "TURN", "GPU is free and you are first: start within %d min (gpuq run/start) "
+                            "or the jobs behind you may go first" % (TURN_GRACE // 60))
+        elif ok and (now() - since).total_seconds() > TURN_GRACE:
+            mark(l, "SKIP", "no start within %d min of its turn; jobs behind go first until the owner "
+                            "runs gpuq wait/run/start again (it keeps its number)" % (TURN_GRACE // 60))
+            skipped.add(l.name)
+        elif not ok and since is not None:
+            mark(l, "NOTURN")
+    return locks, skipped
+
+
+def evaluate(mine, ignore_unregistered=False, smi=None):
+    """Is it this job's turn on every GPU it is queued on? -> (ok, mode, reasons)"""
+    reasons, mode = [], "exclusive"
+    for me in mine:
+        locks, skipped = turn_pass(me.gpu, smi)
+        skipped.discard(me.name)
+        ok, m, why = evaluate_one(me, locks, smi, skipped, ignore_unregistered)
+        if not ok:
+            reasons.append(why)
+        elif m == "shared":
+            mode = "shared"
+    return (not reasons), mode, reasons
+
+
+def reactivate(mine):
+    """The owner is back: a lock skipped as a no-show rejoins with its number."""
+    for l in mine:
+        if l.owner == USER and l.valid and l.state == "queued" and l.skipped():
+            append_line(l.path, "STATUS", "queued (back after being skipped)")
+
+
+def cuda_env(locks):
+    uuids = [l.gpu.uuid for l in sorted(locks, key=lambda l: l.gpu.index)]
+    if all(uuids):
+        vis = ",".join(uuids)
+    else:
+        vis = ",".join(str(l.gpu.index) for l in sorted(locks, key=lambda l: l.gpu.index))
+    return {"CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": vis}
+
+
+def claim(locks, pid=None):
+    extra = ""
+    if pid:
+        extra = " pid=%d start=%s" % (pid, proc_start(pid))
+    for l in locks:
+        append_line(l.path, "STATUS", "running" + extra)
+
+
+class Pings:
+    """Remembers which foreign log lines were already shown."""
+
+    def __init__(self):
+        self.seen = set()
+
+    def new(self, locks):
+        out = []
+        for l in locks:
+            for e in l.foreign():
+                if e.verb == "NOTURN":
+                    continue
+                k = (e.ts, e.who, e.verb, e.rest)
+                if k not in self.seen:
+                    self.seen.add(k)
+                    out.append(e)
+        return out
+
+
+def wait_turn(ident, poll, ignore_unregistered, timeout=None, out=sys.stdout):
+    """Block until it is our turn. Returns (locks, mode) or exits."""
+    t0, last, pings = time.time(), None, Pings()
+    gpus = list_gpus()
+    reactivate(find_job(ident, gpus))
+    while True:
+        mine = find_job(ident, gpus)
+        for e in pings.new(mine):
+            print("[%s] %s from %s: %s" % (hhmm(), e.verb, e.who, e.rest), file=out, flush=True)
+        if any(not l.valid for l in mine):
+            die("your lock is %s (all its PIDs exited?). `gpuq adopt %s` re-attaches it to this session"
+                % ",".join(l.flag for l in mine if not l.valid), 3)
+        ok, mode, reasons = evaluate(mine, ignore_unregistered, query_smi())
+        if ok:
+            return mine, mode
+        msg = "; ".join(reasons)
+        if msg != last:
+            print("[%s] waiting: %s" % (hhmm(), msg), file=out, flush=True)
+            last = msg
+        if timeout and time.time() - t0 > timeout:
+            print("[%s] timeout, still waiting (lock kept)" % hhmm(), file=out, flush=True)
+            sys.exit(1)
+        time.sleep(poll)
+
+
+# ----------------------------------------------------------------------------- commands
+
+def cmd_status(a):
+    gpus = resolve_gpus(a.gpus) if a.gpus else list_gpus()
+    smi = query_smi()
+    cfg = host_config()
+    if not cfg:
+        print("(no hosts/%s.json: assigned users unknown; ask your human)\n" % HOST)
+    for key in ("reservations", "discussion"):
+        if cfg.get(key):
+            print("%s: %s" % (key, cfg[key]))
+    if cfg.get("reservations") or cfg.get("discussion"):
+        print()
+    for g in gpus:
+        au, an = assigned_user(g)
+        print("gpu%d  %s  %s  assigned: %s" % (
+            g.index, g.name, g.uuid or "(no .gpu-info)", au + (" (%s)" % an if an and an != au else "") if au else "?"))
+        locks = scan(g)
+        running_owners = {l.owner for l in locks if l.valid and l.state == "running"}
+        info = smi.get(g.uuid) if (smi and g.uuid) else None
+        if info:
+            print("      nvidia-smi: %s/%s MiB used, util %s%%" % (info["used"], info["total"], info["util"]))
+            for pid, u, m in info["procs"]:
+                print("      proc: %-10s pid %-8d %6s MiB%s" % (
+                    u, pid, m, "" if u in running_owners else "  [UNREGISTERED: no running lock]"))
+        if not locks:
+            print("      queue: empty")
+        for l in locks:
+            print("      " + l.summary())
+        print()
+    return 0
+
+
+def cmd_mine(a):
+    n = 0
+    for g in list_gpus():
+        for l in scan(g):
+            if l.owner == USER:
+                print("gpu%d  %s" % (g.index, l.summary()))
+                n += 1
+    if not n:
+        print("you have no locks")
+    return 0
+
+
+def cmd_join(a):
+    gpus = resolve_gpus(a.gpus)
+    job = sanitize_job(a.job)
+    owner_pid = a.pid or detect_owner_pid()
+    if not pid_alive(owner_pid):
+        die("owner pid %d is not running" % owner_pid)
+    assigned = [assigned_user(g)[0] == USER for g in gpus]
+    with Mutex(gpus):
+        locks = [l for g in gpus for l in scan(g)]
+        for l in locks:
+            if l.owner == USER and l.valid and l.name.split("-", 1)[1] == "%s-%s" % (USER, job):
+                warn("you already have %s in gpu%d" % (l.name, l.gpu.index))
+        nums = [l.number for l in locks]
+        active = [l.number for l in locks if l.valid]
+        if a.number is not None:
+            n = a.number
+        elif a.front:
+            n = max(0, min(active) - 10) if active else 1000
+        else:
+            n = max(nums) + 10 if nums else 1000
+        if not 0 <= n <= 9999:
+            die("queue number %d out of range 0000-9999 (use --number)" % n)
+        name = "%04d-%s-%s" % (n, USER, job)
+        header = "\n".join([
+            "# gpuq lock v1. Protocol: %s/AGENTS.md" % ROOT,
+            "# APPEND ONLY. Never edit, truncate, rename or delete another user's lock.",
+            "user: " + USER,
+            "host: " + HOST,
+            "gpus: " + ",".join(str(g.index) for g in gpus),
+            "gpu_uuids: " + ",".join(g.uuid or "?" for g in gpus),
+            "created: " + now_iso(),
+            "owner_pid: %d" % owner_pid,
+            "owner_pid_start: %s" % proc_start(owner_pid),
+            "owner_cmd: %s" % (proc_comm(owner_pid) or "?"),
+            "assigned: " + ("yes" if all(assigned) else "partial" if any(assigned) else "no"),
+            "mem: " + a.mem,
+            "share: " + ("yes" if a.share else "no"),
+            "preemptible: " + ("yes" if a.preemptible else "no"),
+            "duration: " + a.duration,
+            "reason: " + " ".join(a.reason.split()),
+            "notes: " + " ".join((a.notes or "").split()),
+            LOG_MARK,
+            "%s %s STATUS queued" % (now_iso(), ME),
+            ""])
+        made = []
+        try:
+            for g in gpus:
+                p = os.path.join(g.dir, name)
+                fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+                made.append(p)
+                try:
+                    os.fchmod(fd, 0o666)  # others must be able to append pings
+                    os.write(fd, header.encode("utf-8"))
+                finally:
+                    os.close(fd)
+        except FileExistsError:
+            for p in made:
+                os.unlink(p)
+            die("%s already exists; pick another --number or job name" % name)
+    print(name)
+    for g in gpus:
+        me = Lock(g, name)
+        ahead = [l.name for l in scan(g) if l.valid and l.name != name and
+                 (l.state == "running" or l.key() < me.key())]
+        print("  gpu%d: %s" % (g.index, ("ahead of you: " + ", ".join(ahead)) if ahead else "nobody ahead"),
+              file=sys.stderr)
+    if a.front:
+        for g in gpus:
+            for l in scan(g):
+                if l.valid and l.state == "running" and l.name != name:
+                    print("  gpu%d: %s is running; ask it to yield: gpuq ping %s \"...\"" % (
+                        g.index, l.name, l.name), file=sys.stderr)
+    print("  next: gpuq run %s -- <cmd>   (or: gpuq wait %s; gpuq start %s)" % (name, name, name),
+          file=sys.stderr)
+    return 0
+
+
+def cmd_check(a):
+    mine = find_job(a.id)
+    reactivate(mine)
+    for l in mine:
+        if not l.valid:
+            print("your lock is %s" % l.flag)
+            return 3
+    ok, mode, reasons = evaluate(mine, a.ignore_unregistered, query_smi())
+    print(("YOUR TURN (%s)" % mode) if ok else "waiting: " + "; ".join(reasons))
+    return 0 if ok else 1
+
+
+def cmd_wait(a):
+    mine, mode = wait_turn(a.id, a.poll, a.ignore_unregistered, a.timeout)
+    env = cuda_env(mine)
+    print("[%s] YOUR TURN (%s) for %s. Claim it now: gpuq start %s (or use gpuq run)" % (
+        hhmm(), mode, mine[0].name, mine[0].name), flush=True)
+    print("export " + " ".join("%s=%s" % kv for kv in env.items()), flush=True)
+    return 0
+
+
+def try_claim(ident, ignore_unregistered, pid=None):
+    gpus = list_gpus()
+    mine = find_job(ident, gpus)
+    with Mutex([l.gpu for l in mine]):
+        mine = find_job(ident, gpus)
+        if all(l.state == "running" for l in mine):
+            return mine, True, []
+        ok, mode, reasons = evaluate(mine, ignore_unregistered, query_smi())
+        if ok:
+            claim(mine, pid)
+        return mine, ok, reasons
+
+
+def cmd_start(a):
+    mine = find_job(a.id)
+    require_owner(mine)
+    reactivate(mine)
+    mine, ok, reasons = try_claim(a.id, a.ignore_unregistered, a.job_pid)
+    if not ok:
+        print("not your turn: " + "; ".join(reasons), file=sys.stderr)
+        return 1
+    if a.job_pid:
+        for l in mine:
+            append_line(l.path, "PID", "%d %s job" % (a.job_pid, proc_start(a.job_pid)))
+    env = cuda_env(mine)
+    print("running: %s. Use exactly these GPUs:" % mine[0].name)
+    print("export " + " ".join("%s=%s" % kv for kv in env.items()))
+    if not a.job_pid:
+        print("after launching the job: gpuq start %s --job-pid <PID>; when done: gpuq leave %s" % (
+            mine[0].name, mine[0].name), file=sys.stderr)
+    return 0
+
+
+def find_by_ino(ino):
+    for g in list_gpus():
+        try:
+            names = os.listdir(g.dir)
+        except OSError:
+            continue
+        for n in names:
+            p = os.path.join(g.dir, n)
+            try:
+                st = os.lstat(p)
+            except OSError:
+                continue
+            if (st.st_dev, st.st_ino) == ino:
+                return p
+    return None
+
+
+def watcher_thread(inos, stop, interval=10):
+    pings = Pings()
+    first = True
+    while not stop.wait(0 if first else interval):
+        locks = []
+        for ino in inos:
+            p = find_by_ino(ino)
+            if p:
+                try:
+                    locks.append(Lock(Gpu(int(GPU_DIR_RE.match(os.path.basename(os.path.dirname(p))).group(1)),
+                                          os.path.dirname(p)), os.path.basename(p)))
+                except (FileNotFoundError, AttributeError):
+                    pass
+        for e in pings.new(locks):
+            if not first:
+                print("[gpuq %s] %s from %s on your lock: %s" % (hhmm(), e.verb, e.who, e.rest),
+                      file=sys.stderr, flush=True)
+        first = False
+
+
+def cmd_run(a):
+    cmd = a.cmd[1:] if a.cmd and a.cmd[0] == "--" else a.cmd
+    if not cmd:
+        die("usage: gpuq run <id> -- <command> [args...]")
+    mine = find_job(a.id)
+    require_owner(mine)
+    me_pid = os.getpid()
+    for l in mine:  # keep the lock alive while this process waits/runs, even if the session dies
+        append_line(l.path, "PID", "%d %s gpuq-run" % (me_pid, proc_start(me_pid)))
+    while True:
+        wait_turn(a.id, a.poll, a.ignore_unregistered, out=sys.stderr)
+        mine, ok, _ = try_claim(a.id, a.ignore_unregistered, me_pid)
+        if ok:
+            break
+    inos = [l.ino for l in mine]
+    env = dict(os.environ)
+    env.update(cuda_env(mine))
+    env["GPUQ_JOB"] = mine[0].name
+    print("[gpuq %s] running %s on %s=%s" % (hhmm(), mine[0].name, "CUDA_VISIBLE_DEVICES",
+                                             env["CUDA_VISIBLE_DEVICES"]), file=sys.stderr, flush=True)
+    child = subprocess.Popen(cmd, env=env)
+    for l in mine:
+        append_line(l.path, "PID", "%d %s job" % (child.pid, proc_start(child.pid)))
+
+    def forward(sig, _frame):
+        # Ctrl-C from our terminal already reaches the child (same process group): don't double it.
+        try:
+            if sig == signal.SIGINT and os.isatty(0) and os.tcgetpgrp(0) == os.getpgrp():
+                return
+        except OSError:
+            pass
+        try:
+            child.send_signal(sig)
+        except OSError:
+            pass
+
+    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGUSR1, signal.SIGUSR2):
+        signal.signal(s, forward)
+    stop = threading.Event()
+    t = threading.Thread(target=watcher_thread, args=(inos, stop), daemon=True)
+    t.start()
+    try:
+        while True:
+            try:
+                rc = child.wait()
+                break
+            except InterruptedError:
+                continue
+    finally:
+        stop.set()
+        for ino in inos:
+            p = find_by_ino(ino)
+            if p:
+                try:
+                    append_line(p, "STATUS", "done exit=%s" % child.returncode)
+                    os.unlink(p)
+                except OSError as e:
+                    warn("could not remove %s: %s" % (p, e))
+    print("[gpuq %s] %s finished (exit %s); lock removed" % (hhmm(), mine[0].name, rc), file=sys.stderr)
+    return rc if rc >= 0 else 128 - rc
+
+
+def cmd_msg(a, verb):
+    for l in find_job(a.id):
+        if verb == "ACK" and l.owner != USER:
+            warn("reply is for the lock owner; use ping to ask %s something" % l.owner)
+        append_line(l.path, verb, " ".join(a.message))
+    return 0
+
+
+def cmd_watch(a):
+    mine = find_job(a.id)
+    fds = {}
+    for l in mine:
+        fd = os.open(l.path, os.O_RDONLY)
+        if not a.all:
+            os.lseek(fd, 0, os.SEEK_END)
+        fds[fd] = b""
+    seen = set()
+    print("[%s] watching %s for messages from others (Ctrl-C to stop)" % (hhmm(), mine[0].name), flush=True)
+    while fds:
+        for fd in list(fds):
+            while True:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                fds[fd] += chunk
+            *lines, fds[fd] = fds[fd].split(b"\n")
+            for raw in lines:
+                m = ENTRY_RE.match(raw.decode("utf-8", "replace"))
+                if not m:
+                    continue
+                e = Entry(*m.groups())
+                k = (e.ts, e.who, e.verb, e.rest)
+                if k in seen or (e.user == USER and not a.all) or (e.verb == "NOTURN" and not a.all):
+                    continue
+                seen.add(k)
+                print("[%s] %s from %s: %s" % (hhmm(), e.verb, e.who, e.rest), flush=True)
+            if os.fstat(fd).st_nlink == 0:
+                os.close(fd)
+                del fds[fd]
+        if fds:
+            time.sleep(a.poll)
+    print("[%s] lock %s was removed; stopped watching" % (hhmm(), mine[0].name), flush=True)
+    return 0
+
+
+def cmd_renumber(a):
+    mine = find_job(a.id)
+    require_owner(mine)
+    if not 0 <= a.number <= 9999:
+        die("number must be 0-9999")
+    new = "%04d-%s" % (a.number, mine[0].name.split("-", 1)[1])
+    with Mutex([l.gpu for l in mine]):
+        done = []
+        try:
+            for l in mine:
+                np = os.path.join(l.gpu.dir, new)
+                os.link(l.path, np)  # fails instead of clobbering if np exists
+                done.append((l.path, np))
+        except FileExistsError:
+            for _, np in done:
+                os.unlink(np)
+            die("%s already exists" % new)
+        for old, np in done:
+            os.unlink(old)
+            append_line(np, "NOTE", "renumbered from %s: %s" % (mine[0].name[:4], " ".join(a.reason)))
+    print(new)
+    return 0
+
+
+def cmd_adopt(a):
+    mine = find_job(a.id)
+    require_owner(mine)
+    pid = a.pid or detect_owner_pid()
+    if not pid_alive(pid):
+        die("pid %d is not running" % pid)
+    for l in mine:
+        append_line(l.path, "PID", "%d %s owner %s" % (pid, proc_start(pid), proc_comm(pid) or "?"))
+    print("%s now kept alive by pid %d (%s)" % (mine[0].name, pid, proc_comm(pid)))
+    return 0
+
+
+def cmd_leave(a):
+    mine = find_job(a.id)
+    require_owner(mine)
+    for l in mine:
+        try:
+            append_line(l.path, "STATUS", "done " + " ".join(a.reason))
+        except OSError:
+            pass
+        os.unlink(l.path)
+        print("removed " + l.path)
+    return 0
+
+
+def cmd_prune(a):
+    n = 0
+    for g in list_gpus():
+        for l in scan(g):
+            if l.valid:
+                continue
+            if l.owner == USER or IS_ROOT:
+                if a.dry_run:
+                    print("would remove %s (%s)" % (l.path, l.flag))
+                else:
+                    os.unlink(l.path)
+                    print("removed %s (%s)" % (l.path, l.flag))
+                n += 1
+            else:
+                print("%s is %s; ignored by the queue. Only %s (or root) can remove it" % (
+                    l.path, l.flag, l.owner))
+    if not n:
+        print("nothing of yours to prune")
+    return 0
+
+
+# ----------------------------------------------------------------------------- cli
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="gpuq",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Cooperative GPU queue. Read %s/AGENTS.md first." % ROOT,
+        epilog="""typical use:
+  gpuq status                                   # who is assigned / running / queued
+  gpuq join 4 resnet-sweep --mem 8G --duration 3h --reason "best effort"
+  gpuq run 1000-%s-resnet-sweep -- python train.py   # waits, sets CUDA_VISIBLE_DEVICES, cleans up
+  gpuq watch 1000-%s-resnet-sweep               # while it runs: see pings, then gpuq reply
+  gpuq ping 1000-other-job "assigned user needs gpu4 by 15:00, can you checkpoint?"
+""" % (USER, USER))
+    sub = p.add_subparsers(dest="cmd", metavar="command")
+
+    def add(name, fn, help_):
+        sp = sub.add_parser(name, help=help_, description=help_)
+        sp.set_defaults(fn=fn)
+        return sp
+
+    def turn_opts(sp):
+        sp.add_argument("--ignore-unregistered", action="store_true",
+                        help="don't wait for GPU processes that have no lock (only after checking with "
+                             "their owner or the assigned user)")
+
+    sp = add("status", cmd_status, "show GPUs, assignments, nvidia-smi usage and queues")
+    sp.add_argument("gpus", nargs="?", help="e.g. 3 or 0,1 (default: all)")
+
+    add("mine", cmd_mine, "list your own locks")
+
+    sp = add("join", cmd_join, "join the queue of one or more GPUs; prints the job id")
+    sp.add_argument("gpus", help="GPU index, or comma list for multi-GPU jobs (e.g. 0,1)")
+    sp.add_argument("job", help="short job name, [a-z0-9._-]")
+    sp.add_argument("--mem", required=True, help="peak GPU memory you expect, e.g. 10G (be honest)")
+    sp.add_argument("--duration", required=True, help="expected run time, e.g. 45m, 6h, 2d")
+    sp.add_argument("--reason", required=True,
+                    help='why / how urgent, e.g. "best effort", "paper deadline 2026-12-01"')
+    sp.add_argument("--notes", help="anything else useful for others")
+    sp.add_argument("--share", action="store_true", help="others may co-run if memory fits; you cap your memory")
+    sp.add_argument("--no-preempt", dest="preemptible", action="store_false",
+                    help="declare that you cannot checkpoint/yield quickly (default: preemptible)")
+    g = sp.add_mutually_exclusive_group()
+    g.add_argument("--front", action="store_true",
+                   help="jump ahead of everyone (assigned user, or justified urgency in --reason)")
+    g.add_argument("--number", type=int, help="explicit queue number 0-9999")
+    sp.add_argument("--pid", type=int, help="pid that keeps the lock alive (default: $CLAUDE_PID or "
+                                            "first non-shell ancestor)")
+
+    sp = add("check", cmd_check, "one-shot: is it my turn? exit 0 yes, 1 no, 3 lock missing/stale")
+    sp.add_argument("id")
+    turn_opts(sp)
+
+    sp = add("wait", cmd_wait, "block until it is your turn (prints pings meanwhile); then run gpuq start")
+    sp.add_argument("id")
+    sp.add_argument("--poll", type=float, default=30, help="seconds between checks (default 30)")
+    sp.add_argument("--timeout", type=float, help="give up after N seconds (lock is kept), exit 1")
+    turn_opts(sp)
+
+    sp = add("start", cmd_start, "claim your turn (marks running) and print the CUDA env to use")
+    sp.add_argument("id")
+    sp.add_argument("--job-pid", type=int, help="pid of the job you launched (keeps the lock alive)")
+    turn_opts(sp)
+
+    sp = add("run", cmd_run, "wait for your turn, run a command on your GPU(s), then remove the lock")
+    sp.add_argument("id")
+    sp.add_argument("--poll", type=float, default=30)
+    turn_opts(sp)
+    sp.add_argument("cmd", nargs=argparse.REMAINDER, help="-- command [args...]")
+
+    for name, verb, h in (("ping", "PING", "send a message to a lock's owner (e.g. ask them to yield)"),
+                          ("reply", "ACK", "answer a ping on your own lock"),
+                          ("note", "NOTE", "append an informational note to a lock")):
+        sp = add(name, (lambda v: lambda a: cmd_msg(a, v))(verb), h)
+        sp.add_argument("id")
+        sp.add_argument("message", nargs="+")
+
+    sp = add("watch", cmd_watch, "stream messages others append to your lock (exits when it is removed)")
+    sp.add_argument("id")
+    sp.add_argument("--poll", type=float, default=5)
+    sp.add_argument("--all", action="store_true", help="also show existing and your own lines")
+
+    sp = add("renumber", cmd_renumber, "move your lock to another queue number")
+    sp.add_argument("id")
+    sp.add_argument("number", type=int)
+    sp.add_argument("reason", nargs="+", help="why (written to the lock)")
+
+    sp = add("adopt", cmd_adopt, "re-attach your lock to this session (after a restart made it stale)")
+    sp.add_argument("id")
+    sp.add_argument("--pid", type=int)
+
+    sp = add("leave", cmd_leave, "mark your job done and delete your lock(s)")
+    sp.add_argument("id")
+    sp.add_argument("reason", nargs="*")
+
+    sp = add("prune", cmd_prune, "delete your stale/done locks (root: everyone's)")
+    sp.add_argument("--dry-run", action="store_true")
+
+    a = p.parse_args()
+    if not getattr(a, "fn", None):
+        p.print_help()
+        return 2
+    try:
+        return a.fn(a) or 0
+    except BrokenPipeError:
+        return 0
+    except KeyboardInterrupt:
+        return 130
+    except PermissionError as e:
+        die("permission denied: %s (other users' locks can only be pinged, not edited)" % e)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
