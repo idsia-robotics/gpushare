@@ -30,6 +30,7 @@ Agents (Claude Code, Codex, …) do this by themselves once you point them at [A
 - **Owners come first.** Each GPU can have an assigned user. Borrowers yield within 30 minutes when that user asks.
 - **The line never gets stuck.** Locks left behind by crashed sessions are ignored. A job that hasn't started 15 minutes after its turn came is skipped.
 - **Nothing is overlooked.** GPU processes that have no lock count as busy, and small jobs can share a GPU when their memory fits.
+- **Made for agents.** Each agent chat is its own identity, even when many share one Unix user. `gpuq inbox` wakes an agent when someone pings it, answers its ping, or a promise it made falls due.
 
 `gpuq status` shows everything at a glance:
 
@@ -39,7 +40,7 @@ gpu0  NVIDIA GeForce RTX 4090  GPU-5d1c2e7a-90b4-4c3e-8f21-6a7b8c9d0e1f  assigne
       nvidia-smi: 20480/24564 MiB used, util 98%
       proc: bob        pid 31337     20470 MiB
       0990-alice-camera-ready            QUEUED    mem=8G share=no preempt=yes dur=40m [assigned user]  "camera-ready figures"
-      1000-bob-llm-sweep                 RUNNING   mem=20G share=no preempt=yes dur=6h  "best effort, checkpoints every 20 min"  last: PING alice 2m ago
+      1000-bob-llm-sweep                 RUNNING   mem=20G share=no preempt=yes dur=6h  "best effort, checkpoints every 20 min"  ends ~17:40  leaving by 14:30  last: PING alice 2m ago
       1010-carol-finetune                QUEUED    mem=12G share=no preempt=yes dur=3h  "workshop deadline Dec 4"
 
 gpu1  NVIDIA GeForce RTX 4090  GPU-a3f09b12-77c5-4d6e-9e10-2b3c4d5e6f70  assigned: bob (Bob Meier)
@@ -78,22 +79,24 @@ sudo /srv/gpushare/setup.sh --install-pointers                             # tel
 gpuq status                                          # who owns, runs and waits for each GPU
 gpuq run 0 finetune --mem 12G --duration 3h --reason "deadline Dec 4" -- python train.py
                                                      # joins, waits, runs on your GPU, cleans up after
-gpuq watch 1010-carol-finetune                       # shows pings to you as they arrive
-gpuq ping 1000-bob-llm-sweep "need gpu0 by 14:00, can you checkpoint?"
+gpuq inbox                                           # pings to you, answers to your pings, reminders
+gpuq ping 1000-bob-llm-sweep --need-by 14:00 "deadline today, can you checkpoint?"
 ```
 
 | Also available | |
 |---|---|
 | `join` · `wait` · `start` · `leave` | queue, wait, claim, release, step by step: for jobs you launch yourself, or several commands on one reservation |
-| `reply` · `note` | answer a ping, or add a note to a lock |
-| `mine` · `check` | list your locks; ask "is it my turn?" (exit code 0 means yes) |
+| `reply` · `note` | answer a ping (`--leave-by 13:45` makes it a promise everyone sees), or add a note to a lock |
+| `mine` · `check` | list your locks and what you still owe; ask "is it my turn?" (exit code 0 means yes) |
 | `renumber` · `adopt` · `prune` | move your place in line; re-attach a lock to a new session; delete your stale locks |
 
-`gpuq <command> --help` lists every option. `gpuq run` sets `CUDA_VISIBLE_DEVICES` to your GPU's UUID. If you run in a container that resets the environment, pass that variable through.
+`gpuq <command> --help` lists every option. `status`, `mine`, `check` and `inbox` also speak `--json`. `gpuq run` sets `CUDA_VISIBLE_DEVICES` to your GPU's UUID. If you run in a container that resets the environment, pass that variable through.
 
 **Using it from an agent:**
-- A lock stays valid as long as the agent's session does (Claude Code: `$CLAUDE_PID`), or the job does.
-- Run `gpuq run` or `gpuq wait` as a background task, and `gpuq watch` under a monitor so pings get noticed.
+- Each agent session is its own identity, even when ten of them run as the same user. A lock belongs to the session that created it, and other sessions ping it instead of removing it.
+- A lock stays valid as long as the agent's session does (Claude Code: `$CLAUDE_PID`), or the job does. A resumed Claude Code chat gets its locks back by itself.
+- Run `gpuq run` and `gpuq inbox --next` as background tasks. The inbox exits on the next event that needs the agent, which wakes it up.
+- After a compaction or a restart, `gpuq mine` tells the agent what it holds and what it still owes.
 - For jobs that must outlive the session: `nohup setsid gpuq run 0 train --mem … -- <cmd> > run.log 2>&1 &`.
 
 ## Maintain

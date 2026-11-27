@@ -26,7 +26,6 @@ ROOT = os.path.realpath(os.environ.get("GPUQ_ROOT") or
                         os.path.dirname(os.path.dirname(os.path.realpath(__file__))))  # <root>/bin/gpuq
 HOST = socket.gethostname().split(".")[0]
 USER = pwd.getpwuid(os.getuid()).pw_name
-ME = USER + "@" + HOST
 IS_ROOT = os.getuid() == 0
 NO_SMI = os.environ.get("GPUQ_NO_SMI") == "1"
 FAKE_SMI = os.environ.get("GPUQ_FAKE_SMI")  # test hook: dir with gpus.csv / apps.csv
@@ -39,6 +38,9 @@ LOG_MARK = "--- log (append-only: gpuq ping/reply/note, or dd; see AGENTS.md) --
 HEADROOM_MIB = 1024
 TURN_GRACE = float(os.environ.get("GPUQ_TURN_GRACE", "900"))  # seconds to start once it's your turn
 MARKERS = ("TURN", "NOTURN", "SKIP")  # written by observers, not by people
+FIELD_RE = re.compile(r"^(need-by|leave-by)=(\S+)$")  # optional structured prefix of PING/ACK text
+UNANSWERED_REMIND = 600  # seconds before the inbox reminds you of a ping you haven't answered
+EXIT_NOT_YET, EXIT_ERROR, EXIT_NO_LOCK, EXIT_OTHER_SESSION = 1, 2, 3, 4
 SHELLS = {"bash", "sh", "zsh", "dash", "fish", "ksh", "tcsh", "csh", "sudo", "env", "timeout",
           "nohup", "setsid", "script", "time", "xargs", "stdbuf", "flock", "gpuq"}
 
@@ -58,9 +60,14 @@ def hhmm():
 
 
 def parse_iso(s):
+    """An aware datetime, or None. Anyone can write timestamps into a lock, so anything odd
+    (no timezone: local time; out-of-range years: None) must not crash other users' gpuq."""
     try:
-        return dt.datetime.fromisoformat(s)
-    except (TypeError, ValueError):
+        t = dt.datetime.fromisoformat(s)
+        if not 1971 <= t.year <= 2999:
+            return None
+        return t.astimezone() if t.tzinfo is None else t
+    except (TypeError, ValueError, OverflowError, OSError):
         return None
 
 
@@ -76,6 +83,55 @@ def ago(ts):
     if s < 172800:
         return "%.1fh ago" % (s / 3600)
     return "%dd ago" % (s // 86400)
+
+
+def parse_duration(s):
+    """'45m', '6h', '1h30m', '2d', '90s' -> seconds; None if not understood or over a year."""
+    s = str(s or "").strip().lower()
+    if not re.fullmatch(r"(\d+(\.\d+)?\s*[smhd]\s*)+", s):
+        return None
+    v = sum(float(n) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[u]
+            for n, u in re.findall(r"(\d+(?:\.\d+)?)\s*([smhd])", s))
+    return v if v <= 366 * 86400 else None
+
+
+def parse_when(s):
+    """A deadline: 'HH:MM' (the next such time), '+90m' / '+1h30m' (from now) or an ISO
+    date-time, within the next 30 days. -> aware datetime, or None."""
+    s = str(s).strip()
+    t = None
+    m = re.match(r"^(\d{1,2}):(\d\d)$", s)
+    if m and int(m.group(1)) < 24 and int(m.group(2)) < 60:
+        hm = dt.time(int(m.group(1)), int(m.group(2)))
+        today = now().date()
+        t = dt.datetime.combine(today, hm).astimezone()  # local zone rules, so DST nights work
+        if t < now() - dt.timedelta(minutes=1):
+            t = dt.datetime.combine(today + dt.timedelta(days=1), hm).astimezone()
+    elif s.startswith("+") and parse_duration(s[1:]) is not None:
+        t = (now() + dt.timedelta(seconds=parse_duration(s[1:]))).replace(microsecond=0)
+    else:
+        t = parse_iso(s)
+    if t is None or not now() - dt.timedelta(days=1) <= t <= now() + dt.timedelta(days=30):
+        return None
+    return t
+
+
+def fmt_when(t):
+    """Local 'HH:MM', with the weekday when it is not today."""
+    try:
+        t = t.astimezone()
+        return t.strftime("%H:%M") if t.date() == now().date() else t.strftime("%a %d %b %H:%M")
+    except (AttributeError, ValueError, OverflowError, OSError):
+        return "?"
+
+
+def parse_fields(rest):
+    """Split leading 'need-by=<iso>' / 'leave-by=<iso>' tokens off a message. -> (fields, text)"""
+    fields, words = {}, rest.split(" ")
+    while words and FIELD_RE.match(words[0]):
+        k, v = FIELD_RE.match(words.pop(0)).groups()
+        fields[k] = v
+    return fields, " ".join(words)
 
 
 def die(msg, code=2):
@@ -152,26 +208,164 @@ def proc_comm(pid):
         return None
 
 
-def pid_alive(pid, start=None):
+def pid_alive(pid, start=None, uid=None):
+    """Running, with the recorded start time (PIDs get reused), and owned by uid if given."""
     s = proc_start(pid)
-    return s is not None and (start is None or s == start)
+    if s is None or (start is not None and s != start):
+        return False
+    if uid is not None:
+        try:
+            return os.stat("/proc/%d" % pid).st_uid == uid
+        except OSError:
+            return False
+    return True
 
 
 def detect_owner_pid():
     """Long-lived process that represents this session: $CLAUDE_PID for Claude Code,
     otherwise the first ancestor that is not a shell (agent CLI, sshd session, tmux...)."""
+    uid = os.getuid()
     cp = os.environ.get("CLAUDE_PID", "")
-    if cp.isdigit() and pid_alive(int(cp)):
+    if cp.isdigit() and pid_alive(int(cp), uid=uid):
         return int(cp)
-    pid, hops = os.getppid(), 0
+    pid, hops, last_own = os.getppid(), 0, None
     while pid > 1 and hops < 64:
         comm = proc_comm(pid)
         if comm is None:
             break
-        if comm not in SHELLS:
+        if not pid_alive(pid, uid=uid):
+            break  # su, sudo, a root-owned daemon: beyond it nothing stands for us
+        try:  # a shell running a script has the script's name as comm, but the shell as exe
+            exe = os.path.basename(os.readlink("/proc/%d/exe" % pid))
+        except OSError:
+            exe = None
+        if comm not in SHELLS and exe not in SHELLS:
             return pid
+        last_own = pid
         pid, hops = proc_ppid(pid), hops + 1
-    return os.getppid()
+    # Only shells: the outermost shell of ours (e.g. the login shell of `sudo -iu`), or this
+    # process (under nohup setsid). Never init, which would keep a lock alive forever.
+    return last_own or os.getpid()
+
+
+_owner = None
+
+
+def my_owner():
+    """(pid, start) of the process that stands for this session (cached)."""
+    global _owner
+    if _owner is None:
+        pid = detect_owner_pid()
+        _owner = (pid, proc_start(pid))
+    return _owner
+
+
+_session = None
+
+
+def session():
+    """(tag, source) naming the agent session (chat) this gpuq runs for. Several agents often
+    share one Unix user, so the user alone can't tell them apart. The tag goes into every log
+    line we write (user@host/tag) and into the header of locks we create.
+      - $GPUQ_SESSION if set (any agent or wrapper can set it);
+      - Claude Code: the session id, which stays the same when a chat is resumed;
+      - otherwise p<pid> of the process that keeps our locks alive (agent CLI, sshd, tmux).
+    Sessions of one user are one trust domain: tags prevent accidents, not attacks."""
+    global _session
+    if _session is None:
+        v = re.sub(r"[^A-Za-z0-9._-]", "", os.environ.get("GPUQ_SESSION", ""))[:24]
+        if v:
+            _session = (v, "env")
+        else:
+            v = re.sub(r"[^A-Za-z0-9]", "", os.environ.get("CLAUDE_CODE_SESSION_ID", ""))[:8]
+            _session = (v, "claude") if v else ("p%d" % my_owner()[0], "pid")
+    return _session
+
+
+def sender():
+    return "%s@%s/%s" % (USER, HOST, session()[0])
+
+
+def from_me(e):
+    """Written by this session (untagged lines of this user come from older gpuq versions)."""
+    return e.user == USER and (e.tag is None or e.tag == session()[0])
+
+
+SAFE_WHO_RE = re.compile(r"^[A-Za-z0-9._-]+(@[A-Za-z0-9._-]+)?(/[A-Za-z0-9._-]+)?$")
+
+
+def show_who(who):
+    """A sender as written in a log line, safe to print: anyone can write anything there,
+    including escape sequences or look-alike characters, so odd names are shown quoted."""
+    return who if SAFE_WHO_RE.match(who) else json.dumps(who)
+
+
+def clean(v, limit=80):
+    """A header value for display: printable characters only, bounded length."""
+    v = "".join(c if c.isprintable() else "?" for c in str(v))
+    return v if len(v) <= limit else v[:limit] + "..."
+
+
+# ----------------------------------------------------------------------------- private records
+
+def state_dir():
+    base = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
+    return os.path.join(base, "gpuq")
+
+
+_records = (None, None)
+
+
+def records():
+    """This user's private notes about their locks, in ~/.local/state/gpuq/locks-<host>.json.
+    Lock files can be appended to by anyone, so they can't prove which of the user's sessions
+    holds a lock after a hand-over, or which promises the user really made. This file can:
+    only its owner can write it. {"holders": {ident: session}, "promises": {ident: {...}}}"""
+    global _records
+    path = os.path.join(state_dir(), "locks-%s.json" % HOST)
+    try:
+        st = os.stat(path)
+        mt = (st.st_ino, st.st_mtime_ns)  # os.replace gives a new inode
+    except OSError:
+        return {"holders": {}, "promises": {}}
+    if _records[0] != mt:
+        try:
+            with open(path) as f:
+                d = json.load(f)
+        except (OSError, ValueError):
+            d = {}
+        d = d if isinstance(d, dict) else {}
+        for k in ("holders", "promises"):
+            if not isinstance(d.get(k), dict):
+                d[k] = {}
+        _records = (mt, d)
+    return _records[1]
+
+
+def update_records(fn):
+    """Apply fn(records) under a lock and save. Returns False if it could not be saved."""
+    global _records
+    path = os.path.join(state_dir(), "locks-%s.json" % HOST)
+    try:
+        os.makedirs(state_dir(), mode=0o700, exist_ok=True)
+        with open(path + ".lock", "a") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            _records = (None, None)
+            d = records()
+            fn(d)
+            live = {l.ident for g in list_gpus() for l in scan(g) if l.owner == USER}
+            if live:  # an empty scan (a hiccup, or no locks) never wipes the records
+                for k in ("holders", "promises"):
+                    d[k] = {i: v for i, v in d[k].items() if i in live}
+            tmp = "%s.%d.tmp" % (path, os.getpid())
+            with open(tmp, "w") as f:
+                json.dump(d, f)
+            os.replace(tmp, path)
+            _records = (None, None)
+        return True
+    except OSError as e:
+        warn("could not save %s: %s" % (path, e))
+        return False
 
 
 # ----------------------------------------------------------------------------- gpus
@@ -313,7 +507,17 @@ def query_smi():
 class Entry:
     def __init__(self, ts, who, verb, rest):
         self.ts, self.who, self.verb, self.rest = ts, who, verb, rest or ""
-        self.user = who.split("@", 1)[0]
+        # who is user@host or user@host/session (older gpuq versions wrote no session)
+        self.user, _, hs = who.partition("@")
+        self.host, _, tag = hs.partition("/")
+        self.tag = tag or None
+        self.fields, self.text = parse_fields(self.rest) if verb in ("PING", "ACK") else ({}, self.rest)
+
+    def time(self):
+        return parse_iso(self.ts)
+
+    def key(self):
+        return (self.ts, self.who, self.verb, self.rest)
 
     def line(self):
         return "%s %s %s%s" % (self.ts, self.who, self.verb, (" " + self.rest) if self.rest else "")
@@ -342,23 +546,49 @@ class Lock:
             if h and not self.log and h.group(1) not in self.header:
                 self.header[h.group(1)] = h.group(2).strip()
         own = [e for e in self.log if e.user == self.owner]
+        self.uid = st.st_uid
+        # Identifies this lock across renumbering (same inode, creation time and job name) but
+        # not when a new lock gets the inode of a removed one.
+        self.ident = "%d:%d:%s:%s" % (st.st_dev, st.st_ino, self.header.get("created", ""), name[5:])
         self.state = "queued"
-        self.pids = []
+        self.pids = []          # every PID that keeps the lock alive
+        owner_entries = []      # (pid, start, session) of the processes that stood for a session
+        self.running_since = None
+        first = re.sub(r"[^A-Za-z0-9._-]", "", self.header.get("session", "")) or None
+        claimed = first
         if self.header.get("owner_pid", "").isdigit():
             s = self.header.get("owner_pid_start", "")
             self.pids.append((int(self.header["owner_pid"]), int(s) if s.isdigit() else None))
+            owner_entries.append(self.pids[-1] + (first,))
         for e in own:
             if e.verb == "STATUS":
                 word = (e.rest.split() or ["queued"])[0].lower()
                 if word in ("queued", "running", "done"):
                     self.state = word
+                    if word == "running" and self.running_since is None:
+                        self.running_since = e.time()
+                    elif word != "running":
+                        self.running_since = None
                 m = re.search(r"pid=(\d+)(?: start=(\d+))?", e.rest)
                 if m:
                     self.pids.append((int(m.group(1)), int(m.group(2)) if m.group(2) else None))
             elif e.verb == "PID":
                 m = re.match(r"(\d+)(?:\s+(\d+))?", e.rest)
+                sm = re.search(r"\bsession=([A-Za-z0-9._-]+)", e.rest)
                 if m:
                     self.pids.append((int(m.group(1)), int(m.group(2)) if m.group(2) else None))
+                    if re.search(r"\bowner\b", e.rest):
+                        owner_entries.append(self.pids[-1] + (sm.group(1) if sm else first,))
+                if sm:
+                    claimed = sm.group(1)
+        # The session that holds the lock: the one that created it, or the last `adopt`.
+        # A hand-over line in the log could be written by anyone, so the owner's own gpuq
+        # trusts only its private record of hand-overs (records()); others see the claim.
+        self.session = claimed
+        if self.owner == USER:
+            self.session = records()["holders"].get(self.ident) or first
+        # The processes that stand for the holding session (not for earlier holders).
+        self.owner_procs = [(p, s) for p, s, ss in owner_entries if ss == self.session]
         self.host = self.header.get("host")
         self.mem = parse_mem(self.header.get("mem"))
         self.share = yes(self.header.get("share", "no"))
@@ -372,23 +602,96 @@ class Lock:
             self.valid, self.flag = True, "other-host"
         elif not self.pids:
             self.valid, self.flag = True, "no-pid"
-        else:
-            self.valid = any(pid_alive(p, s) for p, s in self.pids)
+        else:  # only processes of the lock's owner count, so nobody can keep it alive for them
+            self.valid = any(pid_alive(p, s, self.uid) for p, s in self.pids)
             if not self.valid:
                 self.flag = "stale"
 
     def key(self):
-        c = self.created.timestamp() if self.created else float("inf")
+        try:
+            c = self.created.timestamp() if self.created else float("inf")
+        except (OverflowError, OSError, ValueError):
+            c = float("inf")
         return (self.number, c, self.name)
 
+    @property
+    def live(self):
+        """Valid because a recorded process is running (not just because we can't tell)."""
+        return self.valid and not self.flag
+
+    def owner_alive(self):
+        return any(pid_alive(p, s, self.uid) for p, s in self.owner_procs)
+
+    def is_foreign(self, e):
+        """Written by someone other than the session that holds the lock: another user, or
+        another session of the same user (lines without a session tag come from old gpuq
+        versions or from hand-written lines, and count as the owner's)."""
+        return e.user != self.owner or bool(self.session and e.tag and e.tag != self.session)
+
     def foreign(self):
-        return [e for e in self.log if e.user != self.owner]
+        return [e for e in self.log if self.is_foreign(e)]
+
+    def mine(self):
+        """Held by this session. Locks from before sessions existed count for every session of
+        their owner. So does a lock whose holding process is our own Claude Code process: a chat
+        gets a new session id after /clear, but it is still the same process. (Not for
+        $GPUQ_SESSION, which may tell apart several agents that share one process.)"""
+        if self.owner != USER:
+            return False
+        if self.session is None or self.session == session()[0]:
+            return True
+        if session()[1] != "claude":
+            return False
+        op = my_owner()
+        return any(p == op[0] and s == op[1] and pid_alive(p, s) for p, s in self.owner_procs)
+
+    def unanswered(self):
+        """Pings from others with no ACK from the owner after them."""
+        out = []
+        for e in self.log:
+            if e.verb == "PING" and self.is_foreign(e):
+                out.append(e)
+            elif e.verb == "ACK" and e.user == self.owner:
+                out = []
+        return out
+
+    def promise(self):
+        """(deadline, entry) of the owner's latest `reply --leave-by`; None if there is none,
+        or if it was withdrawn with --leave-by none."""
+        for e in reversed(self.log):
+            if e.verb == "ACK" and e.user == self.owner and "leave-by" in e.fields:
+                t = parse_iso(e.fields["leave-by"])
+                return (t, e) if t is not None else None
+        return None
+
+    def my_promise(self):
+        """(deadline, text) of the promise this session made with `gpuq reply --leave-by`, from
+        this user's private record: promise lines in the log can be written by anyone, so they
+        never decide what gpuq tells the owner to do. None if there is none."""
+        r = records()["promises"].get(self.ident) or {}
+        t = parse_iso(r.get("leave_by")) if r.get("session") == session()[0] else None
+        return (t, str(r.get("text", ""))) if t else None
+
+    def est_end(self):
+        """Start of the run + declared duration, for running jobs; None if unknown."""
+        d = parse_duration(self.header.get("duration"))
+        if self.state != "running" or self.running_since is None or d is None:
+            return None
+        try:
+            return self.running_since + dt.timedelta(seconds=d)
+        except OverflowError:
+            return None
+
+    def who(self, e):
+        """Short sender label: the user, plus the session when it is the owner's own user."""
+        return show_who("%s/%s" % (e.user, e.tag) if (e.tag and e.user == self.owner) else e.user)
 
     def skipped(self):
-        """Passed over as a no-show: a SKIP after the owner's last real activity."""
+        """Passed over as a no-show: a SKIP after the holding session's last real activity
+        (a ping from a sibling session of the same user doesn't bring the lock back)."""
         last = -1
         for i, e in enumerate(self.log):
-            if e.user == self.owner and e.verb not in MARKERS:
+            if not self.is_foreign(e) and e.verb not in MARKERS:
                 last = i
         return any(e.verb == "SKIP" for e in self.log[last + 1:])
 
@@ -415,8 +718,8 @@ class Lock:
             elif self.turn_since():
                 turn = "  its turn since %s" % ago(self.turn_since())
         s = "%-34s %-9s mem=%s share=%s preempt=%s dur=%s" % (
-            self.name, st, h.get("mem", "?"), h.get("share", "?"), h.get("preemptible", "?"),
-            h.get("duration", "?"))
+            self.name, st, clean(h.get("mem", "?"), 12), clean(h.get("share", "?"), 5),
+            clean(h.get("preemptible", "?"), 5), clean(h.get("duration", "?"), 12))
         # Both flags come from the file's owner (st_uid), which the kernel guarantees, not from
         # the file name or header, which whoever created the file can write freely.
         if assigned_user(self.gpu)[0] == self.owner:
@@ -424,11 +727,44 @@ class Lock:
         if not self.name[5:].startswith(self.owner + "-"):
             s += " [file owned by %s!]" % self.owner
         if h.get("reason"):
-            s += '  "%s"' % h["reason"]
+            s += "  " + quote(h["reason"], 120)
+        end = self.est_end()
+        if end and self.valid:
+            s += ("  ends ~%s" % fmt_when(end)) if end > now() else \
+                 ("  past its declared duration by %s" % ago(end).replace(" ago", ""))
+        p = self.promise()
+        if p and self.valid:
+            s += ("  leaving by %s" % fmt_when(p[0])) if p[0] > now() else \
+                 ("  OVERDUE: promised to leave by %s" % fmt_when(p[0]))
+        un = self.unanswered()
+        if un and self.valid:
+            s += "  UNANSWERED PING from %s %s" % (self.who(un[0]), ago(un[0].ts))
         f = [e for e in self.foreign() if e.verb not in MARKERS]
-        if f:
-            s += "  last: %s %s %s" % (f[-1].verb, f[-1].user, ago(f[-1].ts))
+        if f and not (un and self.valid and f[-1] is un[-1]):
+            s += "  last: %s %s %s" % (f[-1].verb, self.who(f[-1]), ago(f[-1].ts))
         return s + turn
+
+    def to_json(self):
+        h, p, end = self.header, self.promise(), self.est_end()
+
+        def ent(e):
+            return {"time": e.ts, "from": e.who, "verb": e.verb, "text": e.text, **e.fields}
+        return {
+            "id": self.name, "gpu": self.gpu.index, "number": self.number, "path": self.path,
+            "owner": self.owner, "session": self.session, "this_session": self.mine(),
+            "state": "skipped" if (self.valid and self.state == "queued" and self.skipped()) else self.state,
+            "valid": self.valid, "flag": self.flag or None,
+            "assigned_user": assigned_user(self.gpu)[0] == self.owner,
+            "mem": h.get("mem"), "mem_mib": self.mem, "share": self.share,
+            "preemptible": yes(h.get("preemptible", "yes")), "duration": h.get("duration"),
+            "reason": h.get("reason"), "notes": h.get("notes") or None, "created": h.get("created"),
+            "running_since": self.running_since.isoformat() if self.running_since else None,
+            "est_end": end.isoformat() if end else None,
+            "turn_since": self.turn_since().isoformat() if self.turn_since() else None,
+            "promise_leave_by": p[0].isoformat() if p else None,
+            "unanswered_pings": [ent(e) for e in self.unanswered()],
+            "messages": [ent(e) for e in self.foreign() if e.verb not in MARKERS][-5:],
+        }
 
 
 def scan(gpu):
@@ -487,12 +823,71 @@ def require_owner(locks):
             die("%s belongs to %s; you can only ping it (gpuq ping)" % (l.path, l.owner))
 
 
+def require_session(locks, force=False, adopting=False):
+    """Several agents often run as one user. Refuse to change a lock that another session
+    of yours still holds, so one agent can't 'clean up' a sibling's running job by accident.
+    A lock is still held while any of its processes runs; for adopt, while its holding
+    session runs (re-attaching a lock whose job outlived its session is what adopt is for).
+    Agents are refused. A person typing in a terminal (no stable session id, stdin a TTY) only
+    gets a warning, since a person at a second terminal usually means it. Returns the locks
+    of other sessions that may be acted on."""
+    require_owner(locks)
+    others = [l for l in locks if l.owner == USER and not l.mine()]
+    for l in others:
+        held = l.owner_alive() if adopting else l.live
+        if not held or force or IS_ROOT:
+            continue
+        msg = "%s is held by another session of yours (session %s, %s)" % (
+            l.name, l.session, "still running" if l.owner_alive() else "its job is still running")
+        if session()[1] == "pid" and sys.stdin.isatty():
+            warn(msg + "; going ahead because you are typing in a terminal")
+            continue
+        die(msg + ". If you really mean to act on it, ask that session or your human first, then repeat "
+            "with --force; to talk to it, use gpuq ping", EXIT_OTHER_SESSION)
+    return others
+
+
+def hand_over(locks, pid=None):
+    """Make this session the holder of locks (adopt, or start/run on another session's lock):
+    a PID line for everyone to see, and the private record that this user's gpuq trusts."""
+    pid, start = (pid, proc_start(pid)) if pid else my_owner()
+    if not pid_alive(pid, uid=os.getuid()):
+        die("pid %d is not running, or is not yours" % pid)
+    tag = session()[0]
+    for l in locks:
+        append_line(l.path, "PID", "%d %s owner %s session=%s" % (pid, start, proc_comm(pid) or "?", tag))
+
+    def put(d):
+        for l in locks:
+            d["holders"][l.ident] = tag
+    if not update_records(put):
+        warn("the hand-over is in the lock file, but your other sessions may still see the old holder")
+
+
+def reattach(locks):
+    """Resumed agent sessions keep their session id but run in a new process, which leaves
+    their locks stale. Re-attach this session's stale queued locks to the current process.
+    Only for session ids that survive a restart (Claude Code, $GPUQ_SESSION), never for
+    p<pid> tags. A stale running lock is left alone: its job has ended."""
+    tag, source = session()
+    if source == "pid":
+        return []
+    out = []
+    pid, start = my_owner()
+    for l in locks:
+        if l.owner == USER and l.session == tag and l.flag == "stale" and l.state == "queued" and pid_alive(pid):
+            append_line(l.path, "PID", "%d %s owner %s session=%s (resumed)" % (
+                pid, start, proc_comm(pid) or "?", tag))
+            out.append(l.name)
+    return out
+
+
 def append_line(path, verb, msg=""):
     """Append one log line. Deliberately WITHOUT O_CREAT: with fs.protected_regular=1 the
     kernel refuses O_CREAT opens of other users' files in sticky world-writable dirs,
     so `>>`, `tee -a` and open(p, 'a') fail on someone else's lock. Plain O_APPEND works."""
     msg = " ".join(str(msg).split())
-    line = "%s %s %s%s\n" % (now_iso(), ME, verb, (" " + msg) if msg else "")
+    line = "%s %s %s%s\n" % (now_iso(), sender(), verb, (" " + msg) if msg else "")
     fd = os.open(path, os.O_WRONLY | os.O_APPEND)
     try:
         os.write(fd, line.encode("utf-8"))
@@ -566,11 +961,19 @@ def evaluate_one(me, locks, smi, skipped, ignore_unregistered=False):
     if not running and not unreg:
         return True, "exclusive", None
     if running:
+        def busy(ls, why=""):
+            def eta(l):
+                end = l.est_end()
+                return "" if end is None else (" ends ~%s" % fmt_when(end)) if end > now() else \
+                    " past its declared duration"
+            return (tag + "busy: " + ", ".join(l.name + eta(l) for l in ls) + " running" + why +
+                    ' -- to ask for the GPU: gpuq ping %s --need-by HH:MM "who you are, what you need, by when"'
+                    % ls[0].name)
         if not me.share:
-            return False, None, tag + "busy: " + ", ".join(l.name for l in running) + " running"
-        ns = [l.name for l in running if not l.share]
+            return False, None, busy(running)
+        ns = [l for l in running if not l.share]
         if ns:
-            return False, None, tag + "busy: " + ", ".join(ns) + " running (not shareable)"
+            return False, None, busy(ns, " (not shareable)")
         if me.mem is None or any(l.mem is None for l in running):
             return False, None, tag + "cannot share: some job did not declare mem"
         total = g.total or (info and info["total"]) or 0
@@ -636,7 +1039,7 @@ def evaluate(mine, ignore_unregistered=False, smi=None):
 def reactivate(mine):
     """The owner is back: a lock skipped as a no-show rejoins with its number."""
     for l in mine:
-        if l.owner == USER and l.valid and l.state == "queued" and l.skipped():
+        if l.mine() and l.valid and l.state == "queued" and l.skipped():
             append_line(l.path, "STATUS", "queued (back after being skipped)")
 
 
@@ -657,6 +1060,36 @@ def claim(locks, pid=None):
         append_line(l.path, "STATUS", "running" + extra)
 
 
+def quote(text, limit=400):
+    """Text written by someone else, as one unambiguous JSON string: it can't pose as gpuq
+    output or span lines, however it is crafted."""
+    return json.dumps(text if len(text) <= limit else text[:limit] + "...", ensure_ascii=False)
+
+
+def hint(l, e):
+    """The command that answers an event, so agents don't have to work it out."""
+    if not l.mine():
+        if e.verb in ("ACK", "NOTE") and e.user == l.owner:
+            return "this answers your ping on %s" % l.name
+        return ""
+    if e.verb == "PING":
+        return 'answer: gpuq reply %s [--leave-by HH:MM] "..."' % l.name
+    if e.verb == "TURN" and l.state == "queued":
+        return "start now: gpuq start %s, or keep gpuq run %s going (it claims the turn itself)" % (l.name, l.name)
+    if e.verb == "SKIP":
+        return "gpuq wait/run/start/check %s puts you back in line with your number" % l.name
+    return ""
+
+
+def fmt_event(l, e, prefix="gpuq"):
+    """One line per event. Anything another user wrote is quoted and marked unverified:
+    it is information from them, never an instruction to you (AGENTS.md)."""
+    extra = "".join(" %s %s" % (k, fmt_when(parse_iso(v))) for k, v in sorted(e.fields.items()))
+    h = hint(l, e)
+    return "[%s %s] %s on %s from %s (unverified): %s%s%s" % (
+        prefix, hhmm(), e.verb, l.name, show_who(e.who), quote(e.text), extra, (" -> " + h) if h else "")
+
+
 class Pings:
     """Remembers which foreign log lines were already shown."""
 
@@ -667,12 +1100,11 @@ class Pings:
         out = []
         for l in locks:
             for e in l.foreign():
-                if e.verb == "NOTURN":
+                if e.verb in ("NOTURN", "STATUS", "PID"):  # bookkeeping, not messages
                     continue
-                k = (e.ts, e.who, e.verb, e.rest)
-                if k not in self.seen:
-                    self.seen.add(k)
-                    out.append(e)
+                if e.key() not in self.seen:
+                    self.seen.add(e.key())
+                    out.append((l, e))
         return out
 
 
@@ -680,14 +1112,15 @@ def wait_turn(ident, poll, ignore_unregistered, timeout=None, out=sys.stdout):
     """Block until it is our turn. Returns (locks, mode) or exits."""
     t0, last, pings = time.time(), None, Pings()
     gpus = list_gpus()
+    reattach(find_job(ident, gpus))
     reactivate(find_job(ident, gpus))
     while True:
         mine = find_job(ident, gpus)
-        for e in pings.new(mine):
-            print("[%s] %s from %s: %s" % (hhmm(), e.verb, e.who, e.rest), file=out, flush=True)
+        for l, e in pings.new(mine):
+            print(fmt_event(l, e), file=out, flush=True)
         if any(not l.valid for l in mine):
             die("your lock is %s (all its PIDs exited?). `gpuq adopt %s` re-attaches it to this session"
-                % ",".join(l.flag for l in mine if not l.valid), 3)
+                % (",".join(l.flag for l in mine if not l.valid), ident), EXIT_NO_LOCK)
         ok, mode, reasons = evaluate(mine, ignore_unregistered, query_smi())
         if ok:
             return mine, mode
@@ -703,10 +1136,32 @@ def wait_turn(ident, poll, ignore_unregistered, timeout=None, out=sys.stdout):
 
 # ----------------------------------------------------------------------------- commands
 
+def status_json(gpus, smi):
+    cfg, out = host_config(), []
+    for g in gpus:
+        locks = scan(g)
+        running_owners = {l.owner for l in locks if l.valid and l.state == "running"}
+        info = smi.get(g.uuid) if (smi and g.uuid) else None
+        au, an = assigned_user(g)
+        out.append({
+            "gpu": g.index, "name": g.name, "uuid": g.uuid, "memory_total_mib": g.total,
+            "assigned": {"user": au, "name": an} if au else None,
+            "nvidia_smi": None if not info else {
+                "used_mib": info["used"], "total_mib": info["total"], "util_percent": info["util"],
+                "processes": [{"user": u, "pid": pid, "mib": m, "registered": u in running_owners}
+                              for pid, u, m in info["procs"]]},
+            "locks": [l.to_json() for l in locks]})
+    return {"host": HOST, "time": now_iso(), "you": {"user": USER, "session": session()[0]},
+            "reservations": cfg.get("reservations"), "gpus": out}
+
+
 def cmd_status(a):
     gpus = resolve_gpus(a.gpus) if a.gpus else list_gpus()
     smi = query_smi()
     cfg = host_config()
+    if a.json:
+        print(json.dumps(status_json(gpus, smi), indent=1))
+        return 0
     if not cfg:
         print("(no hosts/%s.json: assigned users unknown; ask your human)\n" % HOST)
     if cfg.get("reservations"):
@@ -731,15 +1186,54 @@ def cmd_status(a):
     return 0
 
 
+def my_locks():
+    """All locks owned by this user, after re-attaching this session's stale ones."""
+    locks = [l for g in list_gpus() for l in scan(g) if l.owner == USER]
+    if reattach(locks):
+        locks = [l for g in list_gpus() for l in scan(g) if l.owner == USER]
+    return locks
+
+
+def pending(l):
+    """What the owner of l still owes: unanswered pings and a due or overdue promise."""
+    out = []
+    for e in l.unanswered():
+        out.append("unanswered PING from %s %s: %s%s -> answer: gpuq reply %s [--leave-by HH:MM] \"...\"" % (
+            show_who(e.who), ago(e.ts), quote(e.text),
+            "".join(" %s %s" % (k, fmt_when(parse_iso(v))) for k, v in sorted(e.fields.items())), l.name))
+    mp, lp = l.my_promise(), l.promise()
+    if mp and mp[0] <= now():
+        out.append("OVERDUE: you promised to leave by %s (%s) -> stop your job (gpuq run then removes the lock) "
+                   "or gpuq leave %s; if you need longer, say so: gpuq reply %s --leave-by HH:MM \"...\""
+                   % (fmt_when(mp[0]), quote(mp[1]), l.name, l.name))
+    elif mp:
+        out.append("you promised to leave by %s: %s" % (fmt_when(mp[0]), quote(mp[1])))
+    if (lp[0] if lp else None) != (mp[0] if mp else None):
+        out.append("the log shows %s, which differs from what this session promised (another session of yours, "
+                   "or someone else wrote it): others see that line in gpuq status" % (
+                       "a promise in your name to leave by %s" % fmt_when(lp[0]) if lp else "no promise"))
+    return out
+
+
 def cmd_mine(a):
-    n = 0
-    for g in list_gpus():
-        for l in scan(g):
-            if l.owner == USER:
-                print("gpu%d  %s" % (g.index, l.summary()))
-                n += 1
-    if not n:
+    locks = my_locks()
+    if a.json:
+        print(json.dumps({"you": {"user": USER, "session": session()[0]},
+                          "locks": [l.to_json() for l in locks]}, indent=1))
+        return 0
+    print("you are %s, session %s" % (USER, session()[0]))
+    done = set()
+    for l in locks:
+        who = "this session" if l.mine() else "session %s" % l.session
+        print("gpu%d  %s  [%s]" % (l.gpu.index, l.summary(), who))
+        if l.mine() and l.valid and l.name not in done:  # once per job, not per GPU
+            done.add(l.name)
+            for p in pending(l):
+                print("        " + p)
+    if not locks:
         print("you have no locks")
+    elif any(not l.mine() for l in locks):
+        print("locks of your other sessions are theirs: ping them rather than leave/start/renumber them")
     return 0
 
 
@@ -762,8 +1256,12 @@ def do_join(a):
     gpus = resolve_gpus(a.gpus)
     job = sanitize_job(a.job)
     owner_pid = a.pid or detect_owner_pid()
-    if not pid_alive(owner_pid):
-        die("owner pid %d is not running" % owner_pid)
+    if not pid_alive(owner_pid, uid=os.getuid()):
+        die("owner pid %d is not running, or is not yours (only your own processes keep your lock alive)"
+            % owner_pid)
+    if parse_duration(a.duration) is None:
+        warn("can't read --duration %r (use e.g. 45m, 6h, 1h30m, 2d), so nobody sees when you expect to "
+             "finish" % a.duration)
     assigned = [assigned_user(g)[0] == USER for g in gpus]
     with Mutex(gpus):
         locks = [l for g in gpus for l in scan(g)]
@@ -792,6 +1290,7 @@ def do_join(a):
             "owner_pid: %d" % owner_pid,
             "owner_pid_start: %s" % proc_start(owner_pid),
             "owner_cmd: %s" % (proc_comm(owner_pid) or "?"),
+            "session: " + session()[0],
             "assigned: " + ("yes" if all(assigned) else "partial" if any(assigned) else "no"),
             "mem: " + a.mem,
             "share: " + ("yes" if a.share else "no"),
@@ -800,7 +1299,7 @@ def do_join(a):
             "reason: " + " ".join(a.reason.split()),
             "notes: " + " ".join((a.notes or "").split()),
             LOG_MARK,
-            "%s %s STATUS queued" % (now_iso(), ME),
+            "%s %s STATUS queued" % (now_iso(), sender()),
             ""])
         made = []
         try:
@@ -835,14 +1334,23 @@ def do_join(a):
 
 def cmd_check(a):
     mine = find_job(a.id)
+    if reattach(mine):
+        mine = find_job(a.id)
     reactivate(mine)
-    for l in mine:
-        if not l.valid:
-            print("your lock is %s" % l.flag)
-            return 3
+    bad = [l for l in mine if not l.valid]
+    if bad:
+        if a.json:
+            print(json.dumps({"id": mine[0].name, "your_turn": False, "lock": bad[0].flag}))
+        else:
+            print("your lock is %s" % bad[0].flag)
+        return EXIT_NO_LOCK
     ok, mode, reasons = evaluate(mine, a.ignore_unregistered, query_smi())
-    print(("YOUR TURN (%s)" % mode) if ok else "waiting: " + "; ".join(reasons))
-    return 0 if ok else 1
+    if a.json:
+        print(json.dumps({"id": mine[0].name, "your_turn": ok, "mode": mode if ok else None,
+                          "reasons": reasons, "env": cuda_env(mine) if ok else None}))
+    else:
+        print(("YOUR TURN (%s)" % mode) if ok else "waiting: " + "; ".join(reasons))
+    return 0 if ok else EXIT_NOT_YET
 
 
 def cmd_wait(a):
@@ -869,7 +1377,11 @@ def try_claim(ident, ignore_unregistered, pid=None):
 
 def cmd_start(a):
     mine = find_job(a.id)
-    require_owner(mine)
+    others = require_session(mine, a.force)
+    if [l for l in others if not l.owner_alive()]:  # its session is gone: take the lock over
+        hand_over([l for l in others if not l.owner_alive()])
+    if reattach(find_job(a.id)):
+        mine = find_job(a.id)
     reactivate(mine)
     mine, ok, reasons = try_claim(a.id, a.ignore_unregistered, a.job_pid)
     if not ok:
@@ -917,10 +1429,9 @@ def watcher_thread(inos, stop, interval=10):
                                           os.path.dirname(p)), os.path.basename(p)))
                 except (FileNotFoundError, AttributeError):
                     pass
-        for e in pings.new(locks):
+        for l, e in pings.new(locks):
             if not first:
-                print("[gpuq %s] %s from %s on your lock: %s" % (hhmm(), e.verb, e.who, e.rest),
-                      file=sys.stderr, flush=True)
+                print(fmt_event(l, e), file=sys.stderr, flush=True)
         first = False
 
 
@@ -948,7 +1459,10 @@ def cmd_run(a):
                 a.job, a.target, RUN_USAGE))
         ident = a.target
     mine = find_job(ident)
-    require_owner(mine)
+    others = require_session(mine, a.force)
+    if [l for l in others if not l.owner_alive()]:  # its session is gone: take the lock over
+        hand_over([l for l in others if not l.owner_alive()])
+    reattach(find_job(ident))
     me_pid = os.getpid()
     for l in mine:  # keep the lock alive while this process waits/runs, even if the session dies
         append_line(l.path, "PID", "%d %s gpuq-run" % (me_pid, proc_start(me_pid)))
@@ -964,7 +1478,7 @@ def cmd_run(a):
             mine, ok, _ = try_claim(ident, a.ignore_unregistered, me_pid)
             if ok:
                 break
-    except (KeyboardInterrupt, SystemExit):
+    except BaseException:  # interrupted, killed, or a crash: don't leave behind a lock we made
         if created:  # we made this lock, so don't leave it behind if we never started
             for l in find_job_quiet(ident):
                 try:
@@ -1023,21 +1537,260 @@ def cmd_run(a):
 
 
 def cmd_msg(a, verb):
-    for l in find_job(a.id):
+    fields = []
+    for k in ("need_by", "leave_by"):
+        v = getattr(a, k, None)
+        if not v:
+            continue
+        name = k.replace("_", "-")
+        if k == "leave_by" and v.strip().lower() == "none":
+            fields.append("leave-by=none")  # withdraws an earlier promise
+            continue
+        t = parse_when(v)
+        if t is None:
+            die("cannot read --%s %r: use HH:MM, +90m or an ISO date-time, within 30 days" % (name, v))
+        fields.append("%s=%s" % (name, t.isoformat(timespec="seconds")))
+    text = " ".join(" ".join(a.message).split())  # the form append_line will write
+    if text.split(" ")[0] and FIELD_RE.match(text.split(" ")[0]):
+        text = "- " + text  # don't let free text pose as a structured field
+    locks = find_job(a.id)
+    for l in locks:
         if verb == "ACK" and l.owner != USER:
             warn("reply is for the lock owner; use ping to ask %s something" % l.owner)
-        append_line(l.path, verb, " ".join(a.message))
+        elif verb == "ACK" and not l.mine():
+            warn("%s is held by your session %s; it should answer its own pings" % (l.name, l.session))
+        append_line(l.path, verb, " ".join(fields + [text]))
+    lb = [f.split("=", 1)[1] for f in fields if f.startswith("leave-by=")]
+    if lb and all(l.owner == USER for l in locks):
+        def put(d):  # the private proof that this session made the promise (see Lock.my_promise)
+            for l in locks:
+                if lb[0] == "none":
+                    d["promises"].pop(l.ident, None)
+                else:
+                    d["promises"][l.ident] = {"session": session()[0], "leave_by": lb[0], "text": text}
+        update_records(put)
+    for f in fields:
+        k, v = f.split("=", 1)
+        print("%s %s" % (k, "withdrawn" if v == "none" else fmt_when(parse_iso(v))))
+    if verb == "PING":
+        print("their answer will reach you in gpuq inbox (also: gpuq status shows it)")
     return 0
+
+
+class Inbox:
+    """Everything that needs this session's attention, each item delivered once:
+      - lines others append to the locks this session holds (pings, notes, TURN, SKIP);
+      - answers on locks this session has pinged (the owner's ACK and NOTE lines);
+      - reminders: a ping unanswered for 10 minutes, a promised leave-by time reached;
+      - jobs that disappear (yours, or the ones you pinged: that GPU may be free now).
+    What was delivered is kept per session in ~/.local/state/gpuq/, so a restarted inbox
+    (a monitor that timed out, a resumed chat) neither repeats nor misses anything. Locks are
+    tracked by inode plus creation time (renumber keeps both; a reused inode doesn't), and
+    messages by job name, since a multi-GPU job has one file per GPU with the same lines."""
+
+    def __init__(self, show_all=False):
+        self.show_all = show_all
+        self.path = os.path.join(state_dir(), "inbox-%s-%s.json" % (HOST, session()[0]))
+        self.watched = 0
+
+    def _load(self):
+        try:
+            with open(self.path) as f:
+                st = json.load(f)
+        except (OSError, ValueError):
+            st = None
+        if not isinstance(st, dict) or not isinstance(st.get("locks"), dict) or st.get("v") != 2:
+            st = {"v": 2, "locks": {}}
+        for k, t in (("reminded", list), ("delivered", dict)):
+            if not isinstance(st.get(k), t):
+                st[k] = t()
+        return st
+
+    def _save(self, st):
+        try:
+            os.makedirs(state_dir(), mode=0o700, exist_ok=True)
+            tmp = "%s.%d.tmp" % (self.path, os.getpid())
+            with open(tmp, "w") as f:
+                json.dump(st, f)
+            os.replace(tmp, self.path)
+        except OSError:
+            return  # no writable home: the inbox still works, it just can't remember across runs
+        try:  # forget sessions that ended long ago (never our own files)
+            for n in os.listdir(state_dir()):
+                p = os.path.join(state_dir(), n)
+                if (n.startswith("inbox-") and n.endswith(".json") and p != self.path
+                        and time.time() - os.path.getmtime(p) > 14 * 86400):
+                    os.unlink(p)
+                    if os.path.exists(p + ".lock"):
+                        os.unlink(p + ".lock")
+        except OSError:
+            pass
+
+    def poll(self, emit):
+        """One pass: emit each new event (oldest first), then remember them as delivered, so a
+        crash in between repeats an event rather than losing it. Returns the number emitted."""
+        lockf = None
+        try:
+            os.makedirs(state_dir(), mode=0o700, exist_ok=True)
+            lockf = open(self.path + ".lock", "a")
+            fcntl.flock(lockf, fcntl.LOCK_EX)
+        except OSError:
+            pass
+        try:
+            st = self._load()
+            events = self._pass(st)
+            for ev in events:
+                emit(ev)
+            self._save(st)
+            return len(events)
+        finally:
+            if lockf:
+                lockf.close()
+
+    def _pass(self, st):
+        events, dedupe = [], set()
+        delivered = {n: set(v) for n, v in st["delivered"].items()}
+
+        def add(kind, l, text, hint_="", e=None):
+            k = "%s|%s" % (kind, "|".join(e.key()) if e else text)
+            if k in delivered.setdefault(l.name, set()) or (l.name, k) in dedupe:
+                return
+            delivered[l.name].add(k)
+            dedupe.add((l.name, k))
+            ev = {"time": now_iso(), "event": kind, "lock": l.name, "gpu": l.gpu.index,
+                  "text": text, "hint": hint_ or None}
+            if e is not None:
+                ev.update({"from": e.who, "sent": e.ts, **e.fields})
+            events.append(ev)
+
+        cur = {}
+        for g in list_gpus():
+            for l in scan(g):
+                role = "mine" if l.mine() else (
+                    "pinged" if any(e.verb == "PING" and from_me(e) for e in l.log) else None)
+                if role is None:
+                    s = st["locks"].pop(l.ident, None)
+                    if s and s.get("role") == "mine" and ("HANDED-OVER", l.name) not in dedupe:
+                        dedupe.add(("HANDED-OVER", l.name))  # adopted by another session of yours
+                        events.append({"time": now_iso(), "event": "HANDED-OVER", "lock": l.name,
+                                       "gpu": l.gpu.index, "text": "your lock is now held by your session %s"
+                                       % l.session, "hint": None})
+                    continue
+                cur[l.ident] = l
+                s = st["locks"].get(l.ident)
+                if s is None or s.get("role") != role:
+                    if role == "pinged":  # the conversation starts with our first ping
+                        first = next(i for i, e in enumerate(l.log) if e.verb == "PING" and from_me(e))
+                    else:  # what came before our last reply has been dealt with
+                        first = max([i + 1 for i, e in enumerate(l.log) if e.verb == "ACK" and from_me(e)] or [0])
+                    s = st["locks"][l.ident] = {"seen": first, "role": role}
+                s["name"], s["gpu"] = l.name, clean(l.header.get("gpus") or l.gpu.index, 20)
+                seen = min(s["seen"], len(l.log))  # a shorter log means someone truncated it
+                new, s["seen"] = l.log[seen:], len(l.log)
+                for e in new:
+                    if from_me(e):
+                        continue
+                    if e.verb in ("STATUS", "PID"):  # bookkeeping (e.g. of an earlier holder), not messages
+                        continue
+                    if role == "mine" and l.is_foreign(e) and (e.verb != "NOTURN" or self.show_all):
+                        add(e.verb, l, e.text, hint(l, e), e)
+                    elif role == "pinged" and e.user == l.owner and e.verb in ("ACK", "NOTE"):
+                        add(e.verb, l, e.text, hint(l, e), e)
+        names_now = {l.name for l in cur.values()}
+        for k, s in list(st["locks"].items()):
+            if k in cur:
+                continue
+            del st["locks"][k]
+            name = s.get("name")
+            if name in names_now or ("REMOVED", name) in dedupe:
+                continue  # another file of the same job is still there, or already reported
+            dedupe.add(("REMOVED", name))
+            txt = ("your lock was removed" if s.get("role") == "mine" else
+                   "a lock you pinged was removed: gpu%s may be free now (gpuq status)" % s.get("gpu"))
+            events.append({"time": now_iso(), "event": "REMOVED", "lock": name, "gpu": s.get("gpu"),
+                           "text": txt, "hint": None})
+        reminded, keep = set(st["reminded"]), set()
+        for k, l in cur.items():
+            if not (l.mine() and l.valid):
+                continue
+            for e in l.unanswered():
+                rk = "u|%s|%s" % (l.name, "|".join(e.key()))
+                keep.add(rk)
+                t = e.time()
+                if rk not in reminded and t and (now() - t).total_seconds() >= UNANSWERED_REMIND:
+                    reminded.add(rk)
+                    add("REMINDER", l, "ping from %s unanswered for %s (AGENTS.md: reply within 15 min): %s"
+                        % (show_who(e.who), ago(t).replace(" ago", ""), quote(e.text)),
+                        'answer: gpuq reply %s [--leave-by HH:MM] "..."' % l.name)
+            p = l.my_promise()  # the private record: a forged promise line never makes gpuq tell you to stop
+            if p:
+                rk = "d|%s|%s" % (l.name, p[0].isoformat())
+                keep.add(rk)
+                if rk not in reminded and p[0] <= now():
+                    reminded.add(rk)
+                    add("DUE", l, "you promised to leave by %s: %s" % (fmt_when(p[0]), quote(p[1])),
+                        "stop your job (gpuq run then removes the lock) or gpuq leave %s; if you need longer, "
+                        'say so: gpuq reply %s --leave-by HH:MM "..."' % (l.name, l.name))
+        st["reminded"] = sorted(reminded & keep)
+        st["delivered"] = {n: sorted(v)[-500:] for n, v in delivered.items() if n in names_now}
+        self.watched = len(cur)
+        return events
+
+
+def fmt_inbox(ev):
+    if ev["event"] in ("REMINDER", "DUE", "REMOVED", "HANDED-OVER"):
+        body = "%s on %s: %s" % (ev["event"], ev["lock"], ev["text"])
+    else:
+        extra = "".join(" %s %s" % (k, fmt_when(parse_iso(ev[k]))) for k in ("leave-by", "need-by") if ev.get(k))
+        body = "%s on %s from %s (unverified): %s%s" % (ev["event"], ev["lock"], show_who(ev["from"]),
+                                                        quote(ev["text"]), extra)
+    return "[gpuq %s] %s%s" % (hhmm(), body, (" -> " + ev["hint"]) if ev.get("hint") else "")
+
+
+def cmd_inbox(a):
+    my_locks()  # re-attaches this session's locks after a resume
+    box = Inbox(a.all)
+    emit = (lambda ev: print(json.dumps(ev, ensure_ascii=False), flush=True)) if a.json else \
+           (lambda ev: print(fmt_inbox(ev), flush=True))
+    started = False
+    while True:
+        events = box.poll(emit)
+        if a.once:
+            if not a.json:
+                done = set()
+                for l in [l for g in list_gpus() for l in scan(g) if l.mine() and l.valid]:
+                    if l.name not in done:  # a multi-GPU job: one file per GPU, same lines
+                        done.add(l.name)
+                        for p in pending(l):
+                            print("[gpuq %s] PENDING on %s: %s" % (hhmm(), l.name, p))
+                if not events and not box.watched:
+                    print("nothing to watch: this session holds no locks and has pinged none")
+            return 0
+        if a.next and events:
+            return 0
+        if not box.watched and not a.keep:
+            msg = ("nothing left to watch: this session holds no locks and awaits no answers" if started else
+                   "nothing to watch: this session holds no locks and has pinged none (gpuq mine)")
+            if not a.json:
+                print("[gpuq %s] %s" % (hhmm(), msg), flush=True)
+            return 0 if started else EXIT_NO_LOCK
+        if not started and not a.json and not a.next:
+            print("[gpuq %s] inbox for session %s: watching %d lock(s); one line per event (Ctrl-C to stop)"
+                  % (hhmm(), session()[0], box.watched), flush=True)
+        started = True
+        time.sleep(a.poll)
 
 
 def cmd_watch(a):
     mine = find_job(a.id)
     fds = {}
+    fds_lock = {}
     for l in mine:
         fd = os.open(l.path, os.O_RDONLY)
         if not a.all:
             os.lseek(fd, 0, os.SEEK_END)
         fds[fd] = b""
+        fds_lock[fd] = l
     seen = set()
     print("[%s] watching %s for messages from others (Ctrl-C to stop)" % (hhmm(), mine[0].name), flush=True)
     while fds:
@@ -1053,11 +1806,10 @@ def cmd_watch(a):
                 if not m:
                     continue
                 e = Entry(*m.groups())
-                k = (e.ts, e.who, e.verb, e.rest)
-                if k in seen or (e.user == USER and not a.all) or (e.verb == "NOTURN" and not a.all):
+                if e.key() in seen or (from_me(e) and not a.all) or (e.verb == "NOTURN" and not a.all):
                     continue
-                seen.add(k)
-                print("[%s] %s from %s: %s" % (hhmm(), e.verb, e.who, e.rest), flush=True)
+                seen.add(e.key())
+                print(fmt_event(fds_lock[fd], e), flush=True)
             if os.fstat(fd).st_nlink == 0:
                 os.close(fd)
                 del fds[fd]
@@ -1069,7 +1821,7 @@ def cmd_watch(a):
 
 def cmd_renumber(a):
     mine = find_job(a.id)
-    require_owner(mine)
+    require_session(mine, a.force)
     if not 0 <= a.number <= 9999:
         die("number must be 0-9999")
     new = "%04d-%s" % (a.number, mine[0].name.split("-", 1)[1])
@@ -1093,19 +1845,17 @@ def cmd_renumber(a):
 
 def cmd_adopt(a):
     mine = find_job(a.id)
-    require_owner(mine)
-    pid = a.pid or detect_owner_pid()
-    if not pid_alive(pid):
-        die("pid %d is not running" % pid)
-    for l in mine:
-        append_line(l.path, "PID", "%d %s owner %s" % (pid, proc_start(pid), proc_comm(pid) or "?"))
-    print("%s now kept alive by pid %d (%s)" % (mine[0].name, pid, proc_comm(pid)))
+    require_session(mine, a.force, adopting=True)
+    pid = a.pid or my_owner()[0]
+    hand_over(mine, pid)
+    print("%s now held by this session (%s) and kept alive by pid %d (%s)" % (
+        mine[0].name, session()[0], pid, proc_comm(pid)))
     return 0
 
 
 def cmd_leave(a):
     mine = find_job(a.id)
-    require_owner(mine)
+    require_session(mine, a.force)
     for l in mine:
         try:
             append_line(l.path, "STATUS", "done " + " ".join(a.reason))
@@ -1148,8 +1898,12 @@ def main():
   gpuq status                                   # who is assigned / running / queued
   gpuq run 4 resnet-sweep --mem 8G --duration 3h --reason "best effort" -- python train.py
                                                 # joins, waits, sets CUDA_VISIBLE_DEVICES, cleans up
-  gpuq watch 1000-%s-resnet-sweep               # while it runs: see pings, then gpuq reply
-  gpuq ping 1000-other-job "assigned user needs gpu4 by 15:00, can you checkpoint?"
+  gpuq inbox                                    # while you hold a lock: pings, answers, reminders
+  gpuq ping 1000-other-job --need-by 15:00 "assigned user needs gpu4, can you checkpoint?"
+  gpuq reply 1000-%s-resnet-sweep --leave-by 14:45 "ok, checkpointing"
+
+exit codes: 0 ok / your turn, 1 not your turn yet, 2 error, 3 no such lock or it is stale,
+4 the lock is held by another live session of yours (see --force)
 """ % USER)
     sub = p.add_subparsers(dest="cmd", metavar="command")
 
@@ -1163,10 +1917,32 @@ def main():
                         help="don't wait for GPU processes that have no lock (only after checking with "
                              "their owner or the assigned user)")
 
+    def json_opt(sp):
+        sp.add_argument("--json", action="store_true", help="machine-readable output")
+
+    def force_opt(sp):
+        sp.add_argument("--force", action="store_true",
+                        help="act on a lock that another live session of yours holds (ask it first)")
+
     sp = add("status", cmd_status, "show GPUs, assignments, nvidia-smi usage and queues")
     sp.add_argument("gpus", nargs="?", help="e.g. 3 or 0,1 (default: all)")
+    json_opt(sp)
 
-    add("mine", cmd_mine, "list your own locks")
+    sp = add("mine", cmd_mine, "list your locks, marking this session's, with the pings and promises "
+                               "you still owe")
+    json_opt(sp)
+
+    sp = add("inbox", cmd_inbox, "everything that needs this session's attention, one line per event: pings "
+                                 "and notes on your locks, answers to your pings, reminders, removed locks")
+    g = sp.add_mutually_exclusive_group()
+    g.add_argument("--next", action="store_true",
+                   help="wait for the next event, print it and exit (run it as a background task, "
+                        "handle the event, run it again)")
+    g.add_argument("--once", action="store_true", help="print what is new or pending, and exit")
+    sp.add_argument("--keep", action="store_true", help="keep running when there is nothing left to watch")
+    sp.add_argument("--all", action="store_true", help="also show NOTURN markers")
+    sp.add_argument("--poll", type=float, default=5, help="seconds between checks (default 5)")
+    json_opt(sp)
 
     def join_opts(sp, required):
         sp.add_argument("--mem", required=required, help="peak GPU memory you expect, e.g. 10G (be honest)")
@@ -1194,6 +1970,7 @@ def main():
     sp = add("check", cmd_check, "one-shot: is it my turn? exit 0 yes, 1 no, 3 lock missing/stale")
     sp.add_argument("id")
     turn_opts(sp)
+    json_opt(sp)
 
     sp = add("wait", cmd_wait, "block until it is your turn (prints pings meanwhile); then run gpuq start")
     sp.add_argument("id")
@@ -1205,6 +1982,7 @@ def main():
     sp.add_argument("id")
     sp.add_argument("--job-pid", type=int, help="pid of the job you launched (keeps the lock alive)")
     turn_opts(sp)
+    force_opt(sp)
 
     sp = add("run", cmd_run, "join the queue (or use an existing lock), wait for your turn, run a command "
                              "on your GPU(s), then remove the lock")
@@ -1214,6 +1992,7 @@ def main():
     sp.add_argument("--poll", type=float, default=30)
     turn_opts(sp)
     join_opts(sp, False)
+    force_opt(sp)
 
     for name, verb, h in (("ping", "PING", "send a message to a lock's owner (e.g. ask them to yield)"),
                           ("reply", "ACK", "answer a ping on your own lock"),
@@ -1221,6 +2000,13 @@ def main():
         sp = add(name, (lambda v: lambda a: cmd_msg(a, v))(verb), h)
         sp.add_argument("id")
         sp.add_argument("message", nargs="+")
+        if name == "ping":
+            sp.add_argument("--need-by", metavar="WHEN",
+                            help="when you need the GPU: HH:MM, +90m or an ISO date-time")
+        if name == "reply":
+            sp.add_argument("--leave-by", metavar="WHEN",
+                            help="promise to free the GPU by then (HH:MM, +90m, ISO); shown in gpuq status, "
+                                 "and your inbox reminds you when it is due")
 
     sp = add("watch", cmd_watch, "stream messages others append to your lock (exits when it is removed)")
     sp.add_argument("id")
@@ -1231,14 +2017,18 @@ def main():
     sp.add_argument("id")
     sp.add_argument("number", type=int)
     sp.add_argument("reason", nargs="+", help="why (written to the lock)")
+    force_opt(sp)
 
-    sp = add("adopt", cmd_adopt, "re-attach your lock to this session (after a restart made it stale)")
+    sp = add("adopt", cmd_adopt, "hand your lock to this session and keep it alive (after a restart made it "
+                                 "stale; Claude Code sessions re-attach their own locks automatically)")
     sp.add_argument("id")
     sp.add_argument("--pid", type=int)
+    force_opt(sp)
 
     sp = add("leave", cmd_leave, "mark your job done and delete your lock(s)")
     sp.add_argument("id")
     sp.add_argument("reason", nargs="*")
+    force_opt(sp)
 
     sp = add("prune", cmd_prune, "delete your stale/done locks (root: everyone's)")
     sp.add_argument("--dry-run", action="store_true")
@@ -1255,8 +2045,11 @@ def main():
         p.print_help()
         return 2
     try:
-        return a.fn(a) or 0
-    except BrokenPipeError:
+        rc = a.fn(a) or 0
+        sys.stdout.flush()
+        return rc
+    except BrokenPipeError:  # e.g. `gpuq status | head`: not an error, and no traceback at exit
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
         return 0
     except KeyboardInterrupt:
         return 130

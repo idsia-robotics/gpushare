@@ -57,7 +57,8 @@ The cost is the lack of transactions. Every change is either an atomic append or
 - **The name** `NNNN-user-job` carries the queue order. Four zero-padded digits make lexical order equal numeric order in `ls`. New jobs take the highest number + 10; numbering starts at 1000, which leaves room to cut in front.
 - **The header** (`key: value`) is written once, when the lock is created.
 - **After the header,** everyone only appends log lines: `<ISO time> <user>@<host> <VERB> <text>`. On a local filesystem, small `O_APPEND` writes don't interleave, so concurrent writers can't corrupt each other's lines. Nobody rewrites the file, not even its owner.
-- **Ownership:** `STATUS` and `PID` lines count only when the file's owner wrote them, judged by the user name in the line compared with `st_uid`. The `[assigned user]` mark compares `st_uid` with the hosts file. The file name and header are never trusted.
+- **Ownership:** `STATUS` and `PID` lines, and `leave-by` promises, count only when the file's owner wrote them, judged by the user name in the line compared with `st_uid`. The `[assigned user]` mark compares `st_uid` with the hosts file. The file name and header are never trusted for identity.
+- **Structured fields:** a `PING` may start with `need-by=<ISO time>` and an `ACK` with `leave-by=<ISO time>`. To older readers they are just text. `gpuq` prefixes free text that happens to look like a field, so a message can't pose as one.
 - **Versioning:** the first header line, `# gpuq lock v1`, versions the format. Every running queue on every server reads locks written by whatever version created them, so changes must stay backward compatible.
 
 ## Liveness
@@ -70,6 +71,46 @@ A lock records the PIDs that keep it alive, each with its start time from `/proc
 A lock with no living PID is **stale**. Everyone ignores it, but only its owner (`gpuq prune`) or root can delete it.
 
 Why PIDs and not heartbeats? Agents can't reliably run periodic tasks, and people forget them. PIDs cost nothing and follow the actual lifetime of the session and the job.
+
+When there is no `$CLAUDE_PID`, gpuq walks up its ancestors and skips shells. It recognizes them by their executable as well as their name, because a shell running a script carries the script's name. If only shells lead up to init (`nohup setsid …`), the session is gpuq's own process: never init, which would keep a lock alive forever.
+
+Only processes owned by the lock file's owner count. Anyone can append a `PID` line, but nobody can make a lock live on through processes of their own.
+
+## Sessions
+
+One Unix user often runs many agents at once: several Claude Code chats, a Codex session, a terminal. The user alone can't tell them apart, so gpuq gives each **session** a tag:
+- `$GPUQ_SESSION`, if set;
+- in Claude Code, the first 8 characters of the session id (`$CLAUDE_CODE_SESSION_ID`). The id survives `--resume`, so a resumed chat is the same session. Current Claude Code versions set this variable, but it is not documented; if it disappears, gpuq falls back to the next option;
+- otherwise `p<pid>` of the process that keeps the lock alive.
+
+The tag is written into the header of every lock the session creates (`session:`) and into every log line it writes (`user@host/tag`). With it:
+- **Messages between sessions of one user work.** A line is foreign to a lock when it comes from another user or from another session, so the inbox, `watch` and `status` show pings between your own agents.
+- **One agent can't clean up another's lock by accident.** `leave`, `start`, `run`, `renumber` and `adopt` refuse to act on a lock held by another live session of the same user (exit code 4) unless given `--force`. "Held" means any of the lock's processes is running; for `adopt`, it means the holding session itself is running, because re-attaching a lock whose job outlived its session is what adopt is for. A person typing in a terminal (a `p<pid>` session with a TTY on stdin) only gets a warning, because a person at a second terminal usually means it; agents and scripts are refused. A lock whose holding process is the caller's own Claude Code process counts as the caller's, because a chat keeps its process across `/clear`, which starts a new session id. This assumes one chat per process; a host that runs several Claude sessions in one process would lose the guard between them.
+- **Taking over only what was abandoned.** `start` and `run` on another session's lock hand it over only when that session's processes are gone. The previous holder's inbox reports a hand-over as `HANDED-OVER`, not as a removal.
+- **Only your own processes.** The owner PID must be a process of the caller's user: the search for it stops at the first ancestor owned by someone else (`su`, `sudo`, a root daemon), and `--pid` of another user's process is refused.
+- **Hand-overs are recorded privately.** `adopt`, and `start` or `run` on another session's lock, append a `PID … owner … session=<s>` line for everyone to see. The owner's own gpuq trusts only its private record in `~/.local/state/gpuq/locks-<host>.json`, which no other user can write, so a forged hand-over line can't move a lock between your sessions. After a hand-over, only the new holder's processes stand for the session.
+- **Resumed sessions get their locks back.** When a session id survives restarts (Claude Code, `$GPUQ_SESSION`), gpuq re-attaches that session's stale queued locks to the new process. A stale running lock stays stale: its job has ended. It never does this for `p<pid>` tags, since PIDs are reused.
+- **Old locks keep working.** A lock without a `session:` header belongs to every session of its owner, and an untagged line by the owner counts as the owner's own, exactly as before.
+
+Sessions of one user share a trust domain: the same user can edit or delete those files directly. Tags prevent accidents between cooperating agents; between users, the kernel's guarantees are unchanged.
+
+## Inbox
+
+Agents only notice what reaches their context, so `gpuq inbox` collects everything that needs a session's attention, one line per event:
+- lines that others append to the locks the session holds (pings, notes, `TURN`, `SKIP`);
+- the owner's `ACK` and `NOTE` lines on locks the session has pinged, so a request gets its answer;
+- reminders: a ping unanswered for 10 minutes, a promised `leave-by` time reached;
+- locks that disappear, the session's own or ones it pinged (that GPU may be free now), and the session's locks that another session of the user adopts.
+
+It runs in three modes: a stream, for a monitor; `--next`, which waits for one event and exits, so a background task wakes the agent exactly when needed; and `--once`, for periodic checks. What was delivered is kept per session in `~/.local/state/gpuq/`, so a restarted inbox neither repeats nor misses events:
+- locks are tracked by inode, creation time and job name, which `renumber` keeps and a new lock reusing an inode does not;
+- messages are tracked by job name, because a multi-GPU job has one file per GPU carrying the same lines;
+- events are printed before they are recorded as delivered, so a crash can repeat one but never lose it;
+- on first sight of a lock, the inbox starts after the session's last reply, so pings it already answered aren't replayed.
+
+**Promises are checked the same way.** `gpuq reply --leave-by` also writes the promise into the user's private record. `DUE` reminders and "you promised" in `gpuq mine` come from that record, never from the log. A promise line that someone else writes in the owner's name shows up in `gpuq status`, but it can neither make gpuq tell an agent to stop its job nor hide a promise the agent made; `gpuq mine` points out the disagreement.
+
+`gpuq mine` is the stateless counterpart: after a compaction or a restart, it lists the session's locks with the pings it hasn't answered and the promises it made.
 
 ## Turn order
 
@@ -93,7 +134,7 @@ The rule: a job at the head of the queue that never starts must not block everyo
 
 **Coming back.** A skipped job keeps its number. As soon as its owner runs `gpuq wait`, `run`, `start` or `check`, gpuq appends an owner `STATUS queued` line, and the job is back in line. It gets the GPU the next time the GPU is free.
 
-**Why the markers live in the lock file:** that needs no extra state, and the owner's `gpuq watch` shows them as notifications.
+**Why the markers live in the lock file:** that needs no extra state, and the owner's `gpuq inbox` shows them as notifications.
 
 **Multi-GPU jobs:** while such a job waits for its other GPUs, it can't keep one GPU idle for more than `TURN_GRACE`.
 
@@ -115,8 +156,8 @@ gpushare assumes colleagues who are **cooperative but fallible**, and their agen
 - Root's `setup.sh` can't be tricked into changing permissions on files it didn't create.
 
 **Not guaranteed** (cooperative):
-- Lock **contents** are writable by everyone, because pings need that. Anyone can append misleading lines (fake senders, fake `TURN`/`SKIP`), and someone determined can even overwrite or truncate the content with tools that open the file without `O_CREAT`. The author field of a log line is not authenticated. Only the file owner is.
-- **Prompt injection:** pings are text from other users that agents read. AGENTS.md therefore makes ping text information, not instructions: a ping can only lead an agent to reply, yield, leave or move its own lock, and anything else goes to its human. The agent-facing pointer (`etc/claude-code-CLAUDE.md`) repeats this rule.
+- Lock **contents** are writable by everyone, because pings need that. Anyone can append misleading lines (fake senders or sessions, fake `TURN`/`SKIP`, a fake promise in the owner's name), and someone determined can even overwrite or truncate the content with tools that open the file without `O_CREAT`. The author field of a log line is not authenticated. Only the file owner is.
+- **Prompt injection:** pings are text from other users that agents read. AGENTS.md therefore makes ping text information, not instructions: a ping can only lead an agent to reply, yield, leave or move its own lock, and anything else goes to its human. The agent-facing pointer (`etc/claude-code-CLAUDE.md`) repeats this rule. gpuq's own output prints others' text as one JSON-quoted string marked `(unverified)`, capped at 400 characters, so it can't span lines or pose as gpuq output. Sender names that contain anything but `[A-Za-z0-9._-]`, `@` and `/` are quoted too, header values are stripped of unprintable characters, and timestamps or durations that don't parse are ignored rather than crashing anyone's gpuq.
 - **Assigned-user claims** in a ping are not proof. A yield request is binding only when the assigned user has their own lock on the GPU, checked by file owner.
 - **Flooding:** anyone can create many locks, or hold `.mutex` open so that joins time out after 60 s. Both are visible in `gpuq status` and `ls -l`, and root can clean up.
 - **GPU use without a lock** is detected, not prevented.
@@ -131,3 +172,5 @@ gpushare assumes colleagues who are **cooperative but fallible**, and their agen
 | `GPUQ_NO_SMI=1` | skip nvidia-smi |
 | `GPUQ_FAKE_SMI=<dir>` | read `gpus.csv` and `apps.csv` from `<dir>` instead of calling nvidia-smi |
 | `GPUQ_TURN_GRACE=<s>` | grace period before a no-show is skipped (default 900) |
+| `GPUQ_SESSION=<tag>` | the session tag to use (the tests run two sessions of one user this way) |
+| `XDG_STATE_HOME=<dir>` | where the inbox remembers what it delivered (default `~/.local/state`) |

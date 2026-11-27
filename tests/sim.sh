@@ -5,7 +5,8 @@ set -u
 G=${1:?path to gpuq}
 T=$(mktemp -d "${TMPDIR:-/tmp}/gpuqsim.XXXX")
 export GPUQ_ROOT=$T GPUQ_NO_SMI=1
-unset CLAUDE_PID
+unset CLAUDE_PID CLAUDE_CODE_SESSION_ID GPUQ_SESSION
+export XDG_STATE_HOME=$T/state
 for i in 0 1 2 3 4; do
   mkdir -p $T/gpu$i; chmod 1777 $T/gpu$i; : > $T/gpu$i/.mutex
   printf 'index: %s\nuuid: GPU-fake-%s\nname: Fake 4080\npci_bus_id: x\nmemory_total_mib: 16376\n' $i $i > $T/gpu$i/.gpu-info
@@ -175,6 +176,207 @@ printf 'user: mallory\nassigned: yes\n--- log ---\n' > $T/gpu1/0500-mallory-fake
 $G status 1 | grep 0500-mallory-fake | grep -q "file owned by $USER" && ok "forged file name flagged" || bad "forged name not flagged"
 $G status 1 | grep 0500-mallory-fake | grep -q 'assigned user' && bad "forged 'assigned: yes' header trusted" || ok "header 'assigned: yes' not trusted"
 rm -f $T/gpu1/0500-mallory-fake
+
+echo "== sessions: several agents under one user"
+SA=$(sess); SB=$(sess)
+ga() { GPUQ_SESSION=alpha CLAUDE_PID=$SA $G "$@"; }   # two chats of the same user
+gb() { GPUQ_SESSION=beta  CLAUDE_PID=$SB $G "$@"; }
+LA=$(ga join 2 sa --mem 1G --duration 2h --reason t 2>/dev/null)
+grep -q '^session: alpha$' $T/gpu2/$LA && ok "header names the session" || bad "no session header"
+grep -q "$USER@$(hostname -s)/alpha STATUS queued" $T/gpu2/$LA && ok "log lines carry the session" || bad "no session tag"
+gb ping $LA --need-by +1h 'need it soon, "really"' >/dev/null
+grep -q "/beta PING need-by=20" $T/gpu2/$LA && ok "ping with --need-by" || bad "need-by: $(tail -1 $T/gpu2/$LA)"
+OUT=$(ga inbox --once)
+echo "$OUT" | grep -q "PING on $LA from $USER@$(hostname -s)/beta (unverified): \"need it soon, \\\\\"really\\\\\"\" need-by" \
+  && ok "inbox shows a sibling session's ping, quoted" || bad "inbox: $OUT"
+echo "$OUT" | grep -q "answer: gpuq reply $LA" && ok "inbox says how to answer" || bad "no hint: $OUT"
+OUT=$(ga inbox --once)
+echo "$OUT" | grep -q "PING on" && bad "inbox repeated a delivered ping" || ok "each event is delivered once"
+echo "$OUT" | grep -q "PENDING on $LA: unanswered PING" && ok "unanswered ping stays pending" || bad "pending: $OUT"
+gb leave $LA >/dev/null 2>&1; expect "sibling can't leave a live lock" 4 $?
+gb renumber $LA 900 x >/dev/null 2>&1; expect "sibling can't renumber it" 4 $?
+gb start $LA >/dev/null 2>&1; expect "sibling can't start it" 4 $?
+gb adopt $LA >/dev/null 2>&1; expect "sibling can't adopt it while its session lives" 4 $?
+[[ -e $T/gpu2/$LA ]] && ok "lock untouched" || bad "lock gone"
+ga mine | grep "$LA" | grep -q '\[this session\]' && ok "mine marks this session" || bad "mine: $(ga mine)"
+gb mine | grep "$LA" | grep -q '\[session alpha\]' && ok "mine marks the sibling's lock" || bad "mine b: $(gb mine)"
+$G status 2 | grep "$LA" | grep -q "UNANSWERED PING from $USER/beta" && ok "status flags the unanswered ping" || bad "status: $($G status 2)"
+ga reply $LA --leave-by +2s "ok, yielding soon" >/dev/null
+OUT=$(gb inbox --once)
+echo "$OUT" | grep -q "ACK on $LA from .*/alpha (unverified): \"ok, yielding soon\" leave-by .* -> this answers your ping" \
+  && ok "pinger's inbox gets the answer" || bad "answer: $OUT"
+$G status 2 | grep "$LA" | grep -q "leaving by" && ok "status shows the promise" || bad "promise: $($G status 2)"
+$G status 2 | grep "$LA" | grep -q UNANSWERED && bad "still unanswered after reply" || ok "reply answers the ping"
+sleep 2.5
+ga inbox --once | grep -q "DUE on $LA: you promised to leave by" && ok "inbox reminds when the promise is due" || bad "no DUE"
+$G status 2 | grep "$LA" | grep -q "OVERDUE" && ok "status shows overdue promise" || bad "overdue: $($G status 2)"
+ga watch --poll 0.2 $LA > $T/watch2.out 2>&1 &
+WP=$!; sleep 0.5; gb ping $LA "second" >/dev/null; sleep 0.6; kill $WP; wait $WP 2>/dev/null
+grep -q '"second"' $T/watch2.out && ok "watch shows sibling pings without --all" || bad "watch2: $(cat $T/watch2.out)"
+ga inbox --once >/dev/null   # drain
+ga inbox --next --poll 0.2 > $T/next.out 2>&1 &
+NP=$!; sleep 0.6; gb note $LA "fyi" >/dev/null; sleep 0.6
+kill -0 $NP 2>/dev/null && { bad "inbox --next did not exit"; kill $NP; } || ok "inbox --next exits on the next event"
+wait $NP 2>/dev/null
+grep -q 'NOTE on .*"fyi"' $T/next.out && ok "inbox --next prints it" || bad "next: $(cat $T/next.out)"
+kill $SA; sleep 0.2
+$G status 2 | grep -q "$LA *STALE" && ok "session gone: lock stale" || bad "not stale"
+SA=$(sess)
+ga mine >/dev/null
+grep -q "session=alpha (resumed)" $T/gpu2/$LA && ok "resumed session re-attaches its lock" || bad "no reattach"
+ga check $LA >/dev/null; expect "lock valid again after resume" 0 $?
+kill $SA; sleep 0.2
+gb adopt $LA >/dev/null; expect "sibling may adopt a lock whose session is gone" 0 $?
+gb mine | grep "$LA" | grep -q '\[this session\]' && ok "adopt hands the lock over" || bad "adopt: $(gb mine)"
+SA=$(sess)
+LB=$(ga join 2 sb --mem 1G --duration 1h --reason t 2>/dev/null)
+gb leave --force $LB >/dev/null; expect "--force overrides" 0 $?
+gb inbox --once >/dev/null
+ga ping $LA "a ping from alpha" >/dev/null
+ga inbox --once >/dev/null
+gb leave $LA >/dev/null
+OUT=$(ga inbox --once)
+echo "$OUT" | grep -q "REMOVED on $LA: a lock you pinged was removed" && ok "pinger hears the lock is gone" || bad "removed: $OUT"
+
+echo "== a sibling's ping doesn't bring a skipped lock back"
+X=$(GPUQ_TURN_GRACE=1 ga join 1 nsx --mem 1G --duration 1m --reason t 2>/dev/null)
+Y=$(GPUQ_TURN_GRACE=1 gb join 1 nsy --mem 1G --duration 1m --reason t 2>/dev/null)
+GPUQ_TURN_GRACE=1 gb check $Y >/dev/null; sleep 1.6; GPUQ_TURN_GRACE=1 gb check $Y >/dev/null
+gb ping $X "are you still there?" >/dev/null
+GPUQ_TURN_GRACE=1 $G status 1 | grep -q "$X *SKIPPED" && ok "still skipped after a sibling's ping" || bad "unskipped: $($G status 1)"
+GPUQ_TURN_GRACE=1 ga check $X >/dev/null
+grep -q "STATUS queued (back" $T/gpu1/$X && ok "its own session brings it back" || bad "no reactivation"
+gb leave $Y >/dev/null; ga leave $X >/dev/null
+
+echo "== old-format locks and lines"
+cat > $T/gpu3/0900-$USER-old <<EOF
+# gpuq lock v1. Protocol: x
+user: $USER
+created: 2026-11-26T10:00:00+01:00
+owner_pid: $SB
+mem: 1G
+duration: 1h
+reason: from an older gpuq
+--- log ---
+2026-11-26T10:00:00+01:00 $USER@$(hostname -s) STATUS queued
+2026-11-26T10:05:00+01:00 bob@$(hostname -s) PING old style ping
+EOF
+chmod 666 $T/gpu3/0900-$USER-old
+ga mine | grep 0900-$USER-old | grep -q '\[this session\]' && ok "lock without session belongs to all your sessions" || bad "old mine"
+ga inbox --once | grep -q 'PING on 0900-.*from bob@.*"old style ping"' && ok "old-format ping in inbox" || bad "old inbox"
+gb leave 0900-$USER-old >/dev/null; expect "old lock can be left" 0 $?
+
+echo "== machine-readable output and hints"
+LJ=$(ga join 0 js --mem 2G --duration 2h --reason t 2>/dev/null); ga start $LJ >/dev/null 2>&1
+LK=$(gb join 0 jt --mem 2G --duration 1h --reason t 2>/dev/null)
+ga status --json | python3 -I -c '
+import json, sys
+d = json.load(sys.stdin)
+l = [l for g in d["gpus"] for l in g["locks"] if l["id"] == sys.argv[1]][0]
+assert d["you"]["session"] == "alpha" and l["this_session"] and l["state"] == "running", d
+assert l["est_end"] and l["session"] == "alpha" and l["mem_mib"] == 2048, l
+' $LJ && ok "status --json" || bad "status --json"
+gb check --json $LK | python3 -I -c '
+import json, sys; d = json.load(sys.stdin); assert d["your_turn"] is False and d["reasons"], d' && ok "check --json" || bad "check --json"
+gb check $LK | grep -q "ends ~.*gpuq ping $LJ --need-by" && ok "busy reason gives ETA and the ping command" || bad "hint: $(gb check $LK)"
+$G status 0 | grep "$LJ" | grep -q "ends ~" && ok "status shows when a running job should end" || bad "eta"
+gb mine --json | python3 -I -c '
+import json, sys; d = json.load(sys.stdin); assert [l for l in d["locks"] if l["this_session"]], d' && ok "mine --json" || bad "mine --json"
+gb ping $LJ 'leave-by=2030-01-01T00:00:00+00:00 fake' >/dev/null
+$G status 0 | grep "$LJ" | grep -q "leaving by" && bad "free text posed as a promise" || ok "free text can't pose as a structured field"
+ga inbox --poll 0.2 > $T/stream.out 2>&1 &
+IP=$!; sleep 0.5; ga leave $LJ >/dev/null; sleep 0.8
+kill -0 $IP 2>/dev/null && { bad "inbox stream kept running with nothing to watch"; kill $IP; } || ok "inbox stream ends when nothing is left"
+grep -q "REMOVED on $LJ: your lock" $T/stream.out && ok "inbox reports your lock's removal" || bad "stream: $(cat $T/stream.out)"
+gb leave $LK >/dev/null
+ga inbox --next >/dev/null 2>&1; expect "inbox with nothing to watch exits 3" 3 $?
+kill $SA $SB 2>/dev/null
+
+echo "== hostile or odd lock contents"
+SA=$(sess); SB=$(sess); H=$(hostname -s)
+LH=$(ga join 1 hostile --mem 1G --duration 3000000d --reason t 2>/dev/null); ga start $LH >/dev/null 2>&1
+gb ping $LH --need-by 0001-01-01T00:00:00+14:00 hi >/dev/null 2>&1; expect "absurd --need-by refused" 2 $?
+for line in "2026-11-27T09:00:00 $USER@$H STATUS running" \
+            "2026-11-27T09:00:00+01:00 $USER@$H/alpha ACK leave-by=0001-01-01T00:00:00+14:00 x" \
+            "2026-11-27T09:00:00+01:00 $USER@$H/alpha ACK leave-by=2026-11-27T09:00:00 tz-less" \
+            "0001-01-01T00:00:00+14:00 bob@$H PING year one" \
+            "$(date -Iseconds) $(printf 'bob\033[2K@h') PING escape in the sender"; do
+  printf '%s\n' "$line" >> $T/gpu1/$LH
+done
+$G status 1 >/dev/null 2>&1; expect "status survives odd dates and durations" 0 $?
+ga mine >/dev/null 2>&1; expect "mine survives them" 0 $?
+ga inbox --once > $T/hostile.out 2>&1; expect "inbox survives them" 0 $?
+grep -q 'from "bob\\u001b\[2K@h"' $T/hostile.out && ok "odd sender shown quoted" || bad "sender: $(cat -v $T/hostile.out)"
+LQ=$(gb join 1 behind --mem 1G --duration 1h --reason t 2>/dev/null)
+gb check $LQ >/dev/null 2>&1; expect "a waiter behind it survives too" 1 $?
+gb leave $LQ >/dev/null
+printf '%s\n' "$(date -Iseconds) $USER@$H/alpha ACK leave-by=$(date -Iseconds -d '-1 min') forged promise" >> $T/gpu1/$LH
+OUT=$(ga inbox --once)
+echo "$OUT" | grep -q "DUE on" && bad "forged promise produced DUE: $OUT" || ok "a promise line alone never produces DUE"
+ga mine | grep -q "differs from what this session promised" && ok "mine flags the unrecorded promise" || bad "mine: $(ga mine)"
+ga reply $LH --leave-by +2s "real promise" >/dev/null
+ga mine | grep -q 'you promised to leave by .*"real promise"' && ok "a recorded promise is the session's own" || bad "recorded: $(ga mine)"
+printf '%s\n' "$(date -Iseconds) $USER@$H/alpha ACK leave-by=x forged withdrawal" >> $T/gpu1/$LH
+sleep 2.5
+ga inbox --once | grep -q 'DUE on .*"real promise"' && ok "a forged later line can't hide a real promise" || bad "hidden promise"
+ga reply $LH --leave-by none "staying after all" >/dev/null
+$G status 1 | grep "$LH" | grep -q "leaving by" && bad "withdrawn promise still shown" || ok "--leave-by none withdraws it"
+ga reply $LH "  leave-by=2030-01-01T00:00:00+00:00 sneaky" >/dev/null
+$G status 1 | grep "$LH" | grep -q "leaving by" && bad "leading spaces let text pose as a field" || ok "leading spaces don't create a field"
+printf '%s\n' "$(date -Iseconds) $USER@$H PID $SB $(awk '{print $22}' /proc/$SB/stat) owner x session=zzz" >> $T/gpu1/$LH
+ga mine | grep "$LH" | grep -q '\[this session\]' && ok "a hand-over line alone doesn't move the lock" || bad "moved: $(ga mine)"
+ga inbox --once | grep -q "REMOVED" && bad "inbox thinks the lock is gone" || ok "inbox keeps watching it"
+ga leave $LH >/dev/null; expect "its session can still leave it" 0 $?
+
+echo "== inbox bookkeeping"
+L1=$(ga join 3 reuse1 --mem 1G --duration 1h --reason t 2>/dev/null); ga inbox --once >/dev/null
+ga leave $L1 >/dev/null; L2=$(ga join 3 reuse2 --mem 1G --duration 1h --reason t 2>/dev/null)
+gb ping $L2 "ping after a leave and rejoin" >/dev/null
+OUT=$(ga inbox --once)
+echo "$OUT" | grep -q '"ping after a leave and rejoin"' && ok "new lock's ping delivered (inode reuse)" || bad "reuse: $OUT"
+echo "$OUT" | grep -q "REMOVED on $L1" && ok "old lock's removal reported" || bad "reuse removed: $OUT"
+ga leave $L2 >/dev/null; ga inbox --once >/dev/null
+LM=$(ga join 0,1 multi2 --mem 1G --duration 1h --reason t 2>/dev/null); ga inbox --once >/dev/null
+gb ping $LM "one ping, two GPUs" >/dev/null
+expect "multi-GPU ping delivered once" 1 "$(ga inbox --once | grep -c '\] PING on .*one ping, two GPUs')"
+ga leave $LM >/dev/null
+expect "multi-GPU removal reported once" 1 "$(ga inbox --once | grep -c "REMOVED on $LM")"
+LR=$(ga join 3 answered --mem 1G --duration 1h --reason t 2>/dev/null)
+gb ping $LR "old question" >/dev/null; ga reply $LR "old answer" >/dev/null
+XDG_STATE_HOME=$T/fresh ga inbox --once | grep -q "old question" && bad "fresh inbox replays answered pings" || ok "fresh inbox skips pings already answered"
+ga leave $LR >/dev/null
+mkdir -p $T/state/gpuq; touch $T/state/gpuq/inbox-$H-gone.json
+touch -d '20 days ago' $T/state/gpuq/inbox-$H-gone.json $T/state/gpuq/inbox-$H-alpha.json.lock
+ga inbox --once >/dev/null
+[[ -e $T/state/gpuq/inbox-$H-alpha.json.lock ]] && ok "inbox keeps its own lock file" || bad "own .lock deleted"
+[[ ! -e $T/state/gpuq/inbox-$H-gone.json ]] && ok "old sessions' state is cleaned up" || bad "old state kept"
+
+echo "== resume, hand-over and terminals"
+LS=$(ga join 4 resumed-run --mem 1G --duration 1h --reason t 2>/dev/null); ga start $LS >/dev/null 2>&1
+kill $SA; sleep 0.2; SA=$(sess); ga mine >/dev/null
+$G status 4 | grep -q "$LS *STALE" && ok "a dead running job is not revived on resume" || bad "revived: $($G status 4)"
+ga prune >/dev/null
+LC=$(ga join 4 handback --mem 1G --duration 1h --reason t 2>/dev/null); ga inbox --once >/dev/null
+gb adopt --force $LC >/dev/null
+ga inbox --once | grep -q "HANDED-OVER on $LC: your lock is now held by your session beta" \
+  && ok "the old holder hears of the hand-over" || bad "handover event: $(ga inbox --once)"
+kill $SB; sleep 0.2
+ga adopt $LC >/dev/null 2>&1; expect "after a hand-over only the new holder's process counts" 0 $?
+SB=$(sess); LT=$(gb join 4 term --mem 1G --duration 1h --reason t 2>/dev/null)
+$G leave $LT >/dev/null 2>&1; expect "a non-agent script can't act on an agent's live lock" 4 $?
+script -qec "$G leave $LT" /dev/null > $T/term.out 2>&1; expect "a person at a terminal may" 0 $?
+grep -q "going ahead because you are typing in a terminal" $T/term.out && ok "with a warning" || bad "no warning: $(cat $T/term.out)"
+$G join 4 rootpid --mem 1G --duration 1h --reason t --pid 1 >/dev/null 2>&1; expect "an owner pid that isn't yours is refused" 2 $?
+ga leave $LC >/dev/null
+setsid -f $G join 4 detached --mem 1G --duration 1h --reason t >/dev/null 2>&1; sleep 0.5
+D=$(ls $T/gpu4 | grep detached)
+grep -q '^owner_pid: 1$' $T/gpu4/$D && bad "detached join owned by init" || ok "detached join is not owned by init"
+$G prune >/dev/null
+$G join 4 dur --mem 1G --duration 1.2.3h --reason t --pid $SA >/dev/null 2>&1
+$G start 1.*-dur >/dev/null 2>&1; true
+$G status 4 | grep dur | grep -q "ends ~" && bad "1.2.3h read as a duration" || ok "malformed duration ignored"
+for f in $(ls $T/gpu4 | grep -E '^[0-9]{4}-'); do $G leave --force $f >/dev/null 2>&1; done
+kill $SA $SB 2>/dev/null
 
 echo "== isolation: planted module next to gpuq is not imported"
 D=$(mktemp -d); cp $G $D/gpuq; echo 'raise SystemExit("PLANTED json.py imported")' > $D/json.py
