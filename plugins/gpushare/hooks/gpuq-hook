@@ -1,0 +1,15 @@
+#!/bin/sh
+# Entry point of the gpushare plugin's Claude Code hooks: runs `gpuq hook EVENT` (see bin/gpuq).
+# A hook must never get in the way, so this exits 0 whatever happens, with one exception: when
+# the background waiter has news, it exits 42, and this turns that into the 2 that wakes Claude.
+# (Any other failure, e.g. an older gpuq without `hook`, must not wake it.)
+ev=$1
+for g in "$GPUQ_BIN" "${CLAUDE_PLUGIN_ROOT:-/nonexistent}/../../bin/gpuq" "$(command -v gpuq 2>/dev/null)" \
+         /srv/gpushare/bin/gpuq; do
+  [ -n "$g" ] && [ -x "$g" ] && break  # $GPUQ_BIN, a checkout around the plugin, $PATH, the default
+  g=
+done
+[ -n "$g" ] || exit 0
+"$g" hook "$ev"
+[ $? -eq 42 ] && [ "$ev" = wait ] && exit 2
+exit 0

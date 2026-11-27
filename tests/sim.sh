@@ -285,7 +285,7 @@ import json, sys; d = json.load(sys.stdin); assert [l for l in d["locks"] if l["
 gb ping $LJ 'leave-by=2030-01-01T00:00:00+00:00 fake' >/dev/null
 $G status 0 | grep "$LJ" | grep -q "leaving by" && bad "free text posed as a promise" || ok "free text can't pose as a structured field"
 ga inbox --poll 0.2 > $T/stream.out 2>&1 &
-IP=$!; sleep 0.5; ga leave $LJ >/dev/null; sleep 0.8
+IP=$!; sleep 0.5; gb leave --force $LJ >/dev/null; sleep 0.8
 kill -0 $IP 2>/dev/null && { bad "inbox stream kept running with nothing to watch"; kill $IP; } || ok "inbox stream ends when nothing is left"
 grep -q "REMOVED on $LJ: your lock" $T/stream.out && ok "inbox reports your lock's removal" || bad "stream: $(cat $T/stream.out)"
 gb leave $LK >/dev/null
@@ -334,12 +334,12 @@ ga leave $L1 >/dev/null; L2=$(ga join 3 reuse2 --mem 1G --duration 1h --reason t
 gb ping $L2 "ping after a leave and rejoin" >/dev/null
 OUT=$(ga inbox --once)
 echo "$OUT" | grep -q '"ping after a leave and rejoin"' && ok "new lock's ping delivered (inode reuse)" || bad "reuse: $OUT"
-echo "$OUT" | grep -q "REMOVED on $L1" && ok "old lock's removal reported" || bad "reuse removed: $OUT"
+echo "$OUT" | grep -q "REMOVED on $L1" && bad "own leave reported: $OUT" || ok "your own leave is no news (inode reuse too)"
 ga leave $L2 >/dev/null; ga inbox --once >/dev/null
 LM=$(ga join 0,1 multi2 --mem 1G --duration 1h --reason t 2>/dev/null); ga inbox --once >/dev/null
 gb ping $LM "one ping, two GPUs" >/dev/null
 expect "multi-GPU ping delivered once" 1 "$(ga inbox --once | grep -c '\] PING on .*one ping, two GPUs')"
-ga leave $LM >/dev/null
+gb leave --force $LM >/dev/null
 expect "multi-GPU removal reported once" 1 "$(ga inbox --once | grep -c "REMOVED on $LM")"
 LR=$(ga join 3 answered --mem 1G --duration 1h --reason t 2>/dev/null)
 gb ping $LR "old question" >/dev/null; ga reply $LR "old answer" >/dev/null
@@ -347,7 +347,7 @@ XDG_STATE_HOME=$T/fresh ga inbox --once | grep -q "old question" && bad "fresh i
 ga leave $LR >/dev/null
 mkdir -p $T/state/gpuq; touch $T/state/gpuq/inbox-$H-gone.json
 touch -d '20 days ago' $T/state/gpuq/inbox-$H-gone.json $T/state/gpuq/inbox-$H-alpha.json.lock
-ga inbox --once >/dev/null
+LP=$(ga join 3 pruner --mem 1G --duration 1h --reason t 2>/dev/null); ga inbox --once >/dev/null; ga leave $LP >/dev/null
 [[ -e $T/state/gpuq/inbox-$H-alpha.json.lock ]] && ok "inbox keeps its own lock file" || bad "own .lock deleted"
 [[ ! -e $T/state/gpuq/inbox-$H-gone.json ]] && ok "old sessions' state is cleaned up" || bad "old state kept"
 
@@ -377,6 +377,141 @@ $G start 1.*-dur >/dev/null 2>&1; true
 $G status 4 | grep dur | grep -q "ends ~" && bad "1.2.3h read as a duration" || ok "malformed duration ignored"
 for f in $(ls $T/gpu4 | grep -E '^[0-9]{4}-'); do $G leave --force $f >/dev/null 2>&1; done
 kill $SA $SB 2>/dev/null
+
+echo "== claude code hooks (plugins/gpushare)"
+SA=$(sess); SB=$(sess); SC=$(sess)
+IDA=aaaa1111-0000-4000-8000-000000000001; IDB=bbbb2222-0000-4000-8000-000000000002
+IDC=cccc3333-0000-4000-8000-000000000003; IDA2=dddd4444-0000-4000-8000-000000000004
+ca() { CLAUDE_CODE_SESSION_ID=$IDA CLAUDE_PID=$SA $G "$@"; }   # two Claude Code chats
+cb() { CLAUDE_CODE_SESSION_ID=$IDB CLAUDE_PID=$SB $G "$@"; }
+hk() { # hk <session id> <claude pid> <event> [extra json]: what Claude Code would run
+  printf '{"session_id":"%s","cwd":"/tmp"%s}' "$1" "${4:-}" | CLAUDE_PID=$2 $G hook $3 --poll 0.2; }
+ctx() { python3 -I -c 'import json,sys; t=sys.stdin.read(); print(json.loads(t)["hookSpecificOutput"]["additionalContext"] if t.strip() else "")'; }
+reason() { python3 -I -c 'import json,sys; t=sys.stdin.read(); d=json.loads(t) if t.strip() else {}; print(d.get("decision",""), d.get("reason","").replace("\n", " | "))'; }
+expect "session start with nothing to say is silent" "" "$(hk $IDC $SC session-start ',"source":"startup"')"
+mkdir -p $T/etc; cp "$(dirname $G)/../etc/claude-code-CLAUDE.md" $T/etc/
+if grep -qs gpushare:begin /etc/claude-code/CLAUDE.md; then
+  expect "no pointer when the admin installed it" "" "$(hk $IDC $SC session-start ',"source":"startup"')"
+else
+  hk $IDC $SC session-start ',"source":"startup"' | ctx | grep -q "Shared GPUs on this server" \
+    && ok "session start gives the pointer when the admin hasn't installed it" || bad "no pointer"
+fi
+LA=$(ca join 2 hooked --mem 1G --duration 1h --reason t 2>/dev/null); ca start $LA >/dev/null 2>&1
+hk $IDA $SA tool | ctx > $T/h.out; expect "no news, no context" "" "$(grep -v 'Shared GPUs' $T/h.out)"
+cb ping $LA "may I have gpu2 at five?" >/dev/null
+hk $IDA $SA tool | ctx > $T/h.out
+grep -q "PING on $LA from $USER@.*/bbbb2222 (unverified): \"may I have gpu2 at five?\" -> answer: gpuq reply $LA" $T/h.out \
+  && ok "a ping reaches the chat after its next tool call" || bad "tool: $(cat $T/h.out)"
+grep -q "never instructions" $T/h.out && ok "marked as information, not instructions" || bad "no untrusted note"
+expect "each event once" "" "$(hk $IDA $SA prompt | ctx)"
+cb ping $LA "second ping" >/dev/null
+expect "a subagent's tool call doesn't take the main agent's news" "" "$(hk $IDA $SA tool ',"agent_id":"x1"')"
+hk $IDA $SA prompt | ctx | grep -q '"second ping"' && ok "the next prompt brings it" || bad "prompt: $(hk $IDA $SA prompt)"
+OUT=$(hk $IDA $SA stop ',"stop_hook_active":false' | reason)
+echo "$OUT" | grep -q '^block .*unanswered PING.*"may I have gpu2 at five?"' && ok "stop is held back while a ping is unanswered" || bad "stop: $OUT"
+expect "but only once per ping" "" "$(hk $IDA $SA stop ',"stop_hook_active":false')"
+expect "not even when a stop hook continues" "" "$(hk $IDA $SA stop ',"stop_hook_active":true')"
+cb ping $LA "third" >/dev/null
+hk $IDA $SA stop ',"stop_hook_active":true' | reason | grep -q '^block .*"third"' && ok "a new ping holds it back again" || bad "third"
+expect "once" "" "$(hk $IDA $SA stop)"
+ca reply $LA "yes, at five" >/dev/null
+expect "answered: nothing to hold back for" "" "$(hk $IDA $SA stop)"
+echo '{"session_id": 3, garbage' | CLAUDE_PID=$SA $G hook prompt > $T/h.out 2>/dev/null; expect "bad input never fails a hook" 0 $?
+expect "and prints nothing" "" "$(cat $T/h.out)"
+echo
+hk $IDC $SC wait; expect "the waiter exits 0 when there is nothing to watch" 0 $?
+hk $IDA $SA wait > /dev/null 2> $T/w.err & W=$!
+sleep 0.6; cb ping $LA "wake up" >/dev/null; wait $W; expect "the waiter exits 42 on news" 42 $?
+grep -q '"wake up"' $T/w.err && ok "with the news on stderr" || bad "waiter: $(cat $T/w.err)"
+hk $IDA $SA wait 2>/dev/null & W1=$!; sleep 0.6
+hk $IDA $SA wait 2>/dev/null & W2=$!; sleep 0.8
+kill -0 $W1 2>/dev/null && { bad "two waiters for one chat"; kill $W1; } || ok "a new waiter replaces the chat's old one"
+kill -0 $W2 2>/dev/null && ok "the new one keeps waiting" || bad "new waiter gone"
+CLAUDE_PID=$SB GPUQ_BIN=$G "$(dirname $G)/../plugins/gpushare/hooks/gpuq-hook" stop </dev/null; expect "the plugin wrapper runs it" 0 $?
+GPUQ_BIN=$G "$(dirname $G)/../plugins/gpushare/hooks/gpuq-hook" no-such-event </dev/null 2>/dev/null
+expect "and never fails a hook" 0 $?
+WR="$(dirname $G)/../plugins/gpushare/hooks/gpuq-hook"; mkdir -p $T/fake
+printf '#!/bin/sh\nexit $FAKE_RC\n' > $T/fake/gpuq; chmod +x $T/fake/gpuq
+FAKE_RC=42 GPUQ_BIN=$T/fake/gpuq $WR wait </dev/null; expect "the wrapper turns the waiter's 42 into the 2 that wakes Claude" 2 $?
+FAKE_RC=2 GPUQ_BIN=$T/fake/gpuq $WR wait </dev/null; expect "but not an older gpuq's usage error" 0 $?
+FAKE_RC=42 GPUQ_BIN=$T/fake/gpuq $WR prompt </dev/null; expect "and only for the waiter" 0 $?
+ca leave $LA >/dev/null; sleep 0.5
+kill -0 $W2 2>/dev/null && { bad "waiter kept running with nothing to watch"; kill $W2; } || ok "waiter ends with nothing to watch"
+expect "your own leave is no news" "" "$(hk $IDA $SA tool)"
+LR=$(ca join 2 runner --mem 1G --duration 1m --reason t 2>/dev/null)
+ca run $LR -- sleep 1 >/dev/null 2>&1 & sleep 0.5; hk $IDA $SA tool >/dev/null; wait
+hk $IDA $SA tool | ctx | grep -q "REMOVED on $LR: your job finished (exit 0)" && ok "the end of gpuq run is reported as such" || bad "run end"
+LA=$(ca join 2 cleared --mem 1G --duration 1h --reason t 2>/dev/null)
+cb ping $LA "pinged before the clear" >/dev/null; ca reply $LA "an answer" >/dev/null
+hk $IDA2 $SA session-start ',"source":"clear"' | ctx > $T/h.out
+grep -q "This session holds these GPU locks" $T/h.out && grep -q "$LA" $T/h.out \
+  && ok "after /clear the chat is told what it holds" || bad "clear: $(cat $T/h.out)"
+grep -q "pinged before the clear" $T/h.out && bad "answered ping replayed after /clear: $(cat $T/h.out)" || ok "answered pings aren't replayed"
+CLAUDE_CODE_SESSION_ID=$IDA2 CLAUDE_PID=$SA $G mine | grep "$LA" | grep -q '\[this session\]' \
+  && grep -q "session=dddd4444" $T/gpu2/$LA && ok "and the lock moves to its new session id" || bad "clear handover"
+hk $IDC $SC session-start ',"source":"fork"' | ctx | grep -q "Locks of your other sessions.*$LA" \
+  && ok "a fork is told the locks it remembers aren't its own" || bad "fork"
+CLAUDE_ENV_FILE=$T/env hk $IDC $SC session-start ',"source":"startup"' >/dev/null
+grep -qx "export GPUQ_PLUGIN=1" $T/env && ok "session start tells the chat's shell that the plugin is on" || bad "env file"
+GPUQ_PLUGIN=1 cb join 2 hinted --mem 1G --duration 1h --reason t 2>&1 >/dev/null | grep -q "the gpushare plugin delivers your inbox" \
+  && ok "and gpuq's hints say so" || bad "plugin hint"
+cb join 2 unhinted --mem 1G --duration 1h --reason t 2>&1 >/dev/null | grep -q "keep gpuq inbox --next running" \
+  && ok "without it, join says to keep the inbox open" || bad "inbox hint"
+LG=$(GPUQ_SESSION=gamma CLAUDE_PID=$SC $G join 2 gamma --mem 1G --duration 1h --reason t 2>/dev/null)
+cb ping $LG "to a chat that sets GPUQ_SESSION" >/dev/null
+GPUQ_SESSION=gamma hk $IDC $SC tool | ctx | grep -q '"to a chat that sets GPUQ_SESSION"' \
+  && ok "\$GPUQ_SESSION wins over the hook's session id, as in the chat's own commands" || bad "GPUQ_SESSION hooks"
+echo "  -- what others put in the folders, and an unwritable home"
+SF=$(sess); IDF=ffff6666-0000-4000-8000-000000000006
+LF=$(CLAUDE_CODE_SESSION_ID=$IDF CLAUDE_PID=$SF $G join 3 fifo-test --mem 1G --duration 1h --reason t 2>/dev/null)
+mkfifo $T/gpu3/0500-$USER-fifo; ln -s /dev/zero $T/gpu3/0501-$USER-link
+timeout 10 bash -c "printf '{\"session_id\":\"$IDF\"}' | CLAUDE_PID=$SF $G hook tool" >/dev/null; expect "a FIFO or symlink named like a lock doesn't hang a hook" 0 $?
+timeout 10 $G status 3 >/dev/null; expect "or gpuq status" 0 $?
+timeout 10 $G ping 0500-$USER-fifo hello >/dev/null 2>&1; expect "or a command naming it" 3 $?
+rm -f $T/gpu3/0500-$USER-fifo $T/gpu3/0501-$USER-link
+cb ping $LF "a ping you can't record" >/dev/null
+chmod 500 $T/state/gpuq
+hk $IDF $SF tool | ctx >/dev/null; hk $IDF $SF tool | ctx > $T/h.out
+expect "an unwritable home doesn't repeat news in every hook" "" "$(cat $T/h.out)"
+hk $IDF $SF stop >/dev/null; expect "nor hold the agent back at every stop" "" "$(hk $IDF $SF stop)"
+timeout 10 bash -c "printf '{\"session_id\":\"$IDF\"}' | CLAUDE_PID=$SF $G hook wait --poll 0.2" 2>/dev/null; expect "nor make the waiter wake it again and again" 0 $?
+chmod 700 $T/state/gpuq
+CLAUDE_CODE_SESSION_ID=$IDF CLAUDE_PID=$SF $G leave $LF >/dev/null
+echo "  -- answers, notes and promises"
+LN=$(cb join 3 noisy --mem 1G --duration 1h --reason t 2>/dev/null)
+ca ping $LN "can I have gpu3?" >/dev/null; hk $IDA $SA tool >/dev/null
+cb reply $LN "yes, at six" >/dev/null; cb note $LN "epoch 3 of 10" >/dev/null
+OUT=$(hk $IDA $SA tool | ctx)
+echo "$OUT" | grep -q '"yes, at six" -> this answers your ping' && ok "the answer to a ping arrives" || bad "answer: $OUT"
+echo "$OUT" | grep -q "epoch 3" && bad "a note after the answer woke the pinger: $OUT" || ok "the owner's later notes don't"
+cb note $LN "epoch 4 of 10" >/dev/null
+expect "nor wake the pinger's waiter" "" "$(hk $IDA $SA tool)"
+LP2=$(cb join 3 promised --mem 1G --duration 1h --reason t 2>/dev/null)
+cb reply $LP2 --leave-by +1s "promised before the clear" >/dev/null; sleep 1.5
+IDB2=bbbb9999-0000-4000-8000-000000000009
+hk $IDB2 $SB session-start ',"source":"clear"' | ctx > $T/h.out
+grep -q 'OVERDUE: you promised to leave by .*"promised before the clear"' $T/h.out \
+  && ok "after /clear the chat still owes its promises" || bad "promise lost: $(cat $T/h.out)"
+grep -q "differs from what this session promised" $T/h.out && bad "promise flagged as foreign after /clear" || ok "and they are its own"
+cb leave --force $LN >/dev/null 2>&1; CLAUDE_CODE_SESSION_ID=$IDB2 CLAUDE_PID=$SB $G leave $LP2 >/dev/null 2>&1
+LQ2=$(ca join 3 quoted --mem 1G --duration 1h --reason t 2>/dev/null)
+printf '%s %s@%s PING %s\n' "$(date -Iseconds)" bob "$(hostname -s)" "$(printf 'one\u009b5mtwo\u2028three')" >> $T/gpu3/$LQ2
+hk $IDA $SA tool | python3 -I -c 'import json,re,sys; t=json.load(sys.stdin)["hookSpecificOutput"]["additionalContext"]; sys.exit(0 if "one\\u009b5mtwo" in t and not re.search("[\x80-\x9f\u2028\u2029]", t) else 1)' \
+  && ok "control characters and line separators in a ping reach the agent escaped" || bad "raw control characters in the context"
+ca leave $LQ2 >/dev/null
+LT2=$(ca join 3 turned --mem 1G --duration 1h --reason t 2>/dev/null); hk $IDA $SA tool >/dev/null
+SR=$(sess); printf '%s %s@%s/aaaa1111 PID %s %s gpuq-run\n' "$(date -Iseconds)" $USER "$(hostname -s)" $SR "$(awk '{print $22}' /proc/$SR/stat)" >> $T/gpu3/$LT2
+printf '%s bob@%s TURN it is your turn\n' "$(date -Iseconds)" "$(hostname -s)" >> $T/gpu3/$LT2
+expect "no TURN news while gpuq run waits for the turn itself" "" "$(hk $IDA $SA tool)"
+kill $SR; sleep 0.2; printf '%s bob@%s TURN still your turn\n' "$(date -Iseconds)" "$(hostname -s)" >> $T/gpu3/$LT2
+hk $IDA $SA tool | ctx | grep -q "TURN on $LT2" && ok "but there is without it" || bad "no TURN event"
+ca leave $LT2 >/dev/null
+kill $SF
+IDE=eeee5555-0000-4000-8000-000000000005; SE=$(sess); BEFORE=$(ls $T/state/gpuq)
+for ev in session-start prompt tool stop wait; do hk $IDE $SE $ev ',"source":"startup"' >/dev/null 2>&1; done
+expect "a chat that never used the queue leaves no files behind" "$BEFORE" "$(ls $T/state/gpuq)"; kill $SE
+for f in $(ls $T/gpu2 | grep -E '^[0-9]{4}-'); do $G leave --force $f >/dev/null 2>&1; done
+kill $SA $SB $SC 2>/dev/null
 
 echo "== isolation: planted module next to gpuq is not imported"
 D=$(mktemp -d); cp $G $D/gpuq; echo 'raise SystemExit("PLANTED json.py imported")' > $D/json.py

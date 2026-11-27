@@ -1,0 +1,14 @@
+{
+  "name": "gpushare",
+  "owner": {
+    "name": "IDSIA"
+  },
+  "description": "The gpushare plugin for Claude Code, served from the gpushare checkout itself.",
+  "plugins": [
+    {
+      "name": "gpushare",
+      "source": "./plugins/gpushare",
+      "description": "Delivers gpuq pings and answers to Claude Code agents, wakes idle agents when a ping arrives, and holds an agent back once while a ping waits for an answer."
+    }
+  ]
+}

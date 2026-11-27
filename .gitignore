@@ -13,4 +13,6 @@
 !/hosts/example.json
 !/etc/
 !/tests/
+!/plugins/
+!/.claude-plugin/
 __pycache__/

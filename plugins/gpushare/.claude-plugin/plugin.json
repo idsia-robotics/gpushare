@@ -1,0 +1,10 @@
+{
+  "name": "gpushare",
+  "version": "0.1.0",
+  "description": "Hooks for the gpushare GPU queue: delivers pings and answers to the agent as they arrive, wakes it when it is idle, and holds it back once while a ping waits for an answer.",
+  "author": {"name": "Elia Cereda, IDSIA"},
+  "homepage": "https://github.com/idsia-robotics/gpushare",
+  "repository": "https://github.com/idsia-robotics/gpushare",
+  "license": "MIT",
+  "keywords": ["gpu", "queue", "shared-server"]
+}

@@ -73,6 +73,15 @@ sudo /srv/gpushare/setup.sh --install-pointers                             # tel
 
   For other agents, put the same few lines ([etc/claude-code-CLAUDE.md](etc/claude-code-CLAUDE.md)) in their global instructions, e.g. `~/.codex/AGENTS.md` for Codex. To try it out first, just tell your agent: *"read /srv/gpushare/AGENTS.md before using a GPU"*.
 
+**Claude Code plugin (optional, each user opts in):** the checkout is also a plugin marketplace. The plugin gives Claude Code agents their gpuq inbox without any effort on their part: pings and answers arrive in the agent's context, an idle agent is woken when someone pings it, and it is held back once before it stops while a ping is unanswered. It also gives the agent the instructions above when `--install-pointers` hasn't.
+
+```bash
+claude plugin marketplace add /srv/gpushare
+claude plugin install gpushare@gpushare
+```
+
+All its hooks do is call `gpuq`, so `git pull` updates what they do. Details: [plugins/gpushare](plugins/gpushare/).
+
 ## Use
 
 ```bash
@@ -95,7 +104,7 @@ gpuq ping 1000-bob-llm-sweep --need-by 14:00 "deadline today, can you checkpoint
 **Using it from an agent:**
 - Each agent session is its own identity, even when ten of them run as the same user. A lock belongs to the session that created it, and other sessions ping it instead of removing it.
 - A lock stays valid as long as the agent's session does (Claude Code: `$CLAUDE_PID`), or the job does. A resumed Claude Code chat gets its locks back by itself.
-- Run `gpuq run` and `gpuq inbox --next` as background tasks. The inbox exits on the next event that needs the agent, which wakes it up.
+- Run `gpuq run` and `gpuq inbox --next` as background tasks. The inbox exits on the next event that needs the agent, which wakes it up. With the Claude Code plugin, the agent doesn't need to run the inbox at all.
 - After a compaction or a restart, `gpuq mine` tells the agent what it holds and what it still owes.
 - For jobs that must outlive the session: `nohup setsid gpuq run 0 train --mem … -- <cmd> > run.log 2>&1 &`.
 

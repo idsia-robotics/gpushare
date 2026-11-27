@@ -106,11 +106,32 @@ It runs in three modes: a stream, for a monitor; `--next`, which waits for one e
 - locks are tracked by inode, creation time and job name, which `renumber` keeps and a new lock reusing an inode does not;
 - messages are tracked by job name, because a multi-GPU job has one file per GPU carrying the same lines;
 - events are printed before they are recorded as delivered, so a crash can repeat one but never lose it;
-- on first sight of a lock, the inbox starts after the session's last reply, so pings it already answered aren't replayed.
+- on first sight of a lock, the inbox starts after the owner's last reply, so pings that were already answered aren't replayed (also after a hand-over or a `/clear`);
+- a session's own removals are no news: `gpuq leave` and `prune` tell the inbox beforehand, and the end of `gpuq run` is reported as "your job finished (exit N)" rather than "your lock was removed".
 
 **Promises are checked the same way.** `gpuq reply --leave-by` also writes the promise into the user's private record. `DUE` reminders and "you promised" in `gpuq mine` come from that record, never from the log. A promise line that someone else writes in the owner's name shows up in `gpuq status`, but it can neither make gpuq tell an agent to stop its job nor hide a promise the agent made; `gpuq mine` points out the disagreement.
 
 `gpuq mine` is the stateless counterpart: after a compaction or a restart, it lists the session's locks with the pings it hasn't answered and the promises it made.
+
+## Claude Code plugin
+
+An inbox only helps if the agent keeps it open, and agents forget, or lose track after a compaction. The plugin in `plugins/gpushare` moves the listening into Claude Code's hooks, which run whether or not the agent remembers. Every hook calls `gpuq hook <event>` through `hooks/gpuq-hook`, so the logic lives in `bin/gpuq`, is covered by the same tests, and is updated by `git pull` like the rest.
+
+| Hook | What `gpuq hook` does |
+|---|---|
+| `SessionStart` | gives the pointer from `etc/claude-code-CLAUDE.md` unless `/etc/claude-code/CLAUDE.md` already has it; re-attaches a resumed session's locks; when the Claude Code process switches chats in place (`/clear`, `/resume`), hands the locks it holds, with their promises, to the chat it now runs; reports what the session holds, owes and waits for; sets `GPUQ_PLUGIN=1` for the chat's shell commands, so gpuq's hints stop telling the agent to run the inbox |
+| `UserPromptSubmit`, `PostToolUse` | new inbox events, as context (not inside subagents, whose context the main agent never sees) |
+| `Stop` | holds the agent back once per unanswered ping or due promise, and for events that arrive as it stops |
+| `SessionStart`, `Stop` (async, `asyncRewake`) | the waiter: polls the inbox every 5 s in the background (while the agent is idle, and also during its turns, alongside the other hooks), and exits with the news, which wakes the agent |
+
+Design points:
+- **Silent unless there is news.** With nothing to report, hooks print nothing (except the pointer at session start, when the admin hasn't installed it for everyone), so sessions that don't use GPUs pay a ~50 ms poll per prompt and per tool call and no tokens. Those sessions don't parse other users' locks: a byte search for their own `PING` lines decides whether there is anything to look at, and they leave no files behind.
+- **Bounded.** At most 20 events go into one hook's output; `gpuq mine` lists the rest of what needs an answer. The inbox's flock is taken with a 3 s deadline, and lock files are opened without following symlinks and without blocking, so a FIFO planted under a lock's name can't hang anyone. If the inbox can't record what it delivered (an unwritable home), the hooks say nothing rather than repeat the same news at every tool call, stop and wake-up.
+- **Never in the way.** `gpuq hook` swallows every error and exits 0, and so does the wrapper (a hook that exits 2 would block the user's prompt). The one exception is the waiter: it exits 42 when it has news, and the wrapper turns exactly that into the 2 that wakes Claude. A dedicated code, so that nothing else (an older gpuq without `hook` exits 2 with a usage error) can wake the agent.
+- **One waiter per Claude Code process**, the newest: a new one sends the old one SIGTERM. Signals are blocked from the moment it polls until it exits, so a SIGTERM can't make it drop an event it has taken from the inbox (a SIGKILL at that instant still could). It exits when Claude Code or its wrapper is gone, or nothing is left to watch, and it doesn't run under `claude -p` or the SDKs, which wait for async hooks before they exit. Claude Code stops it after its 24-hour timeout; a ping after that reaches the agent with its next prompt.
+- **What wakes an agent:** pings and notes on its locks, the answer to its ping (not the owner's later notes), reminders, and removals. Not `TURN` or `SKIP` while a `gpuq run` of its own waits for the turn, since that claims it by itself.
+- **Holding back once per item** is also what keeps the Stop hook from looping. It doesn't consult `stop_hook_active`, which Claude Code also sets after the waiter woke the agent, exactly when a ping most needs an answer.
+- **Opt-in per user** while the queue is in beta. The checkout doubles as a local marketplace (`.claude-plugin/marketplace.json`). Claude Code installs a copy of the plugin in its cache, where the wrapper can't find gpuq next to itself: it takes `$GPUQ_BIN`, then `bin/gpuq` of a checkout around the plugin (with `claude --plugin-dir`), then `gpuq` on `$PATH`, then `/srv/gpushare/bin/gpuq`. The hook definitions rarely change; when they do, the plugin's version goes up and `claude plugin update` fetches it.
 
 ## Turn order
 
@@ -159,7 +180,7 @@ gpushare assumes colleagues who are **cooperative but fallible**, and their agen
 - Lock **contents** are writable by everyone, because pings need that. Anyone can append misleading lines (fake senders or sessions, fake `TURN`/`SKIP`, a fake promise in the owner's name), and someone determined can even overwrite or truncate the content with tools that open the file without `O_CREAT`. The author field of a log line is not authenticated. Only the file owner is.
 - **Prompt injection:** pings are text from other users that agents read. AGENTS.md therefore makes ping text information, not instructions: a ping can only lead an agent to reply, yield, leave or move its own lock, and anything else goes to its human. The agent-facing pointer (`etc/claude-code-CLAUDE.md`) repeats this rule. gpuq's own output prints others' text as one JSON-quoted string marked `(unverified)`, capped at 400 characters, so it can't span lines or pose as gpuq output. Sender names that contain anything but `[A-Za-z0-9._-]`, `@` and `/` are quoted too, header values are stripped of unprintable characters, and timestamps or durations that don't parse are ignored rather than crashing anyone's gpuq.
 - **Assigned-user claims** in a ping are not proof. A yield request is binding only when the assigned user has their own lock on the GPU, checked by file owner.
-- **Flooding:** anyone can create many locks, or hold `.mutex` open so that joins time out after 60 s. Both are visible in `gpuq status` and `ls -l`, and root can clean up.
+- **Flooding:** anyone can create many locks, append megabytes to one (every gpuq that reads the folder, and the plugin's hooks of sessions that hold or pinged locks, then read them in full), or hold `.mutex` open so that joins time out after 60 s. All of it is visible in `gpuq status` and `ls -l`, and root can clean up.
 - **GPU use without a lock** is detected, not prevented.
 
 ## Testing hooks
@@ -174,3 +195,5 @@ gpushare assumes colleagues who are **cooperative but fallible**, and their agen
 | `GPUQ_TURN_GRACE=<s>` | grace period before a no-show is skipped (default 900) |
 | `GPUQ_SESSION=<tag>` | the session tag to use (the tests run two sessions of one user this way) |
 | `XDG_STATE_HOME=<dir>` | where the inbox remembers what it delivered (default `~/.local/state`) |
+| `GPUQ_BIN=<path>` | the gpuq that the plugin's hooks run |
+| `GPUQ_HOOK_DEBUG=1` | let `gpuq hook` errors through instead of swallowing them |
