@@ -2046,8 +2046,12 @@ PLUGIN_NOTE = ("The gpushare plugin delivers this session's gpuq inbox: new even
                "so you don't need to run gpuq inbox yourself.")
 
 
-def hook_out(event, text):
-    print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": text}}))
+def hook_out(event, text, note=None):
+    """Context for Claude, and (note) a line for the user, which Claude Code shows outside focus view."""
+    out = {"hookSpecificOutput": {"hookEventName": event, "additionalContext": text}}
+    if note:
+        out["systemMessage"] = note
+    print(json.dumps(out))
 
 
 MAX_HOOK_EVENTS = 20  # a flood of pings must not flood the agent's context
@@ -2061,9 +2065,56 @@ def event_lines(events):
     return out
 
 
+def short_who(who):
+    """For one-line summaries: alice@gpubox/5498ec33 -> alice; one of your own sessions ->
+    "your other chat 5498ec33"."""
+    m = re.match(r"^([^@/\s]+)(?:@[^/\s]*)?(?:/(\S+))?$", who or "")
+    if not m:
+        return show_who(who or "?")
+    if m.group(1) == USER and m.group(2):
+        return "your other chat %s" % show_who(m.group(2))
+    return show_who(m.group(1))
+
+
+def event_summary(ev):
+    """A few words on one event, for the line the user sees ("alice pinged 1010-bob-sweep")."""
+    k, lock, who = ev["event"], ev["lock"], short_who(ev.get("from"))
+    if k == "PING":
+        return "%s pinged %s" % (who, lock)
+    if k == "ACK" and (ev.get("hint") or "").startswith("this answers"):
+        return "%s answered your ping on %s" % (who, lock)
+    if k in ("ACK", "NOTE"):
+        return "%s wrote a %s on %s" % (who, "reply" if k == "ACK" else "note", lock)
+    if k == "TURN":
+        return "it is your turn on %s" % lock
+    if k == "SKIP":
+        return "%s was skipped, because it didn't start on its turn" % lock
+    if k == "REMINDER":
+        return "a ping on %s is still unanswered" % lock
+    if k == "DUE":
+        return "your promised time to leave %s has come" % lock
+    if k == "REMOVED":
+        return "%s: %s" % (lock, ev["text"])
+    if k == "HANDED-OVER":
+        return "%s is now held by another chat of yours" % lock
+    return "%s on %s" % (k, lock)
+
+
+def headline(summaries):
+    """The one line that tells the user what happened."""
+    more = len(summaries) - 3
+    return "gpushare: " + "; ".join(summaries[:3]) + (" (and %d more)" % more if more > 0 else "")
+
+
+def user_line(head):
+    return ('Start your next message to your user with this line, so they know what happened: "%s." '
+            "Then deal with it." % head)
+
+
 def events_text(events):
-    return "\n".join(["gpushare: new for this session (%s):" % session()[0]] + event_lines(events) +
-                      [UNTRUSTED_NOTE])
+    head = headline([event_summary(ev) for ev in events])
+    return "\n".join(["%s (news for this chat, session %s)" % (head, session()[0])] + event_lines(events) +
+                      [user_line(head), UNTRUSTED_NOTE])
 
 
 def new_events():
@@ -2155,7 +2206,7 @@ def hook_news(d, event):
         return
     events = new_events()
     if events:
-        hook_out(event, events_text(events))
+        hook_out(event, events_text(events), headline([event_summary(ev) for ev in events]))
 
 
 def hook_stop(d):
@@ -2172,7 +2223,7 @@ def hook_stop(d):
         held = set(st.get("held", [])) if isinstance(st, dict) else set()
     except (OSError, ValueError, TypeError):
         held = set()
-    owed, keys, done = [], set(), set()
+    owed, keys, done, what = [], set(), set(), []
     for l in [l for g in list_gpus() for l in scan(g) if l.mine() and l.valid]:
         if l.name in done:
             continue
@@ -2182,6 +2233,8 @@ def hook_stop(d):
                 keys.add(k)
                 if k not in held:
                     owed.append("%s: %s" % (l.name, text))
+                    what.append(("your promised time to leave %s has passed" if k.startswith("d|") else
+                                 "a ping on %s has no answer yet") % l.name)
     if keys or os.path.exists(path):  # remember: each of them has now held the agent back once
         try:
             os.makedirs(state_dir(), mode=0o700, exist_ok=True)
@@ -2194,12 +2247,15 @@ def hook_stop(d):
                 return  # can't remember that we asked: never risk asking forever
     if not (events or owed):
         return
-    lines = ["gpushare: before you stop, this needs you (once; you won't be held back again for it):"]
+    head = headline([event_summary(ev) for ev in events] + sorted(set(what), key=what.index))
+    lines = ["%s (held back once before stopping; it won't happen again for these)" % head]
     lines += event_lines(events) + owed[:MAX_HOOK_EVENTS]
     lines.append("Reply to every ping within 15 minutes (AGENTS.md): gpuq reply, with --leave-by HH:MM if you "
                  "agree to yield (then keep it). If the decision is your user's, still reply now, e.g. "
-                 "gpuq reply <id> \"asking my user, answer by HH:MM\", then ask them. " + UNTRUSTED_NOTE)
-    print(json.dumps({"decision": "block", "reason": "\n".join(lines)}))
+                 "gpuq reply <id> \"asking my user, answer by HH:MM\", then ask them.")
+    lines += [user_line(head), UNTRUSTED_NOTE]
+    print(json.dumps({"decision": "block", "reason": "\n".join(lines),
+                      "systemMessage": head + " (Claude is held back once to deal with it)"}))
 
 
 EXIT_WAKE = 42  # `gpuq hook wait` has news; the plugin's wrapper turns it into the 2 that wakes Claude

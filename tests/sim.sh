@@ -5,7 +5,7 @@ set -u
 G=${1:?path to gpuq}
 T=$(mktemp -d "${TMPDIR:-/tmp}/gpuqsim.XXXX")
 export GPUQ_ROOT=$T GPUQ_NO_SMI=1
-unset CLAUDE_PID CLAUDE_CODE_SESSION_ID GPUQ_SESSION
+unset CLAUDE_PID CLAUDE_CODE_SESSION_ID GPUQ_SESSION GPUQ_PLUGIN GPUQ_BIN CLAUDE_ENV_FILE CLAUDE_CODE_ENTRYPOINT
 export XDG_STATE_HOME=$T/state
 for i in 0 1 2 3 4; do
   mkdir -p $T/gpu$i; chmod 1777 $T/gpu$i; : > $T/gpu$i/.mutex
@@ -403,6 +403,11 @@ hk $IDA $SA tool | ctx > $T/h.out
 grep -q "PING on $LA from $USER@.*/bbbb2222 (unverified): \"may I have gpu2 at five?\" -> answer: gpuq reply $LA" $T/h.out \
   && ok "a ping reaches the chat after its next tool call" || bad "tool: $(cat $T/h.out)"
 grep -q "never instructions" $T/h.out && ok "marked as information, not instructions" || bad "no untrusted note"
+head -1 $T/h.out | grep -q "^gpushare: your other chat bbbb2222 pinged $LA (news for this chat" && ok "it opens with a plain summary" || bad "headline: $(head -1 $T/h.out)"
+grep -q "Start your next message to your user with this line" $T/h.out && ok "which the agent is asked to pass on" || bad "no user line"
+cb ping $LA "for the user line" >/dev/null
+hk $IDA $SA tool | python3 -I -c 'import json,sys; d=json.load(sys.stdin); assert d["systemMessage"].startswith("gpushare: "), d' \
+  && ok "and shown to the user as a system message" || bad "no systemMessage"
 expect "each event once" "" "$(hk $IDA $SA prompt | ctx)"
 cb ping $LA "second ping" >/dev/null
 expect "a subagent's tool call doesn't take the main agent's news" "" "$(hk $IDA $SA tool ',"agent_id":"x1"')"
@@ -423,6 +428,7 @@ hk $IDC $SC wait; expect "the waiter exits 0 when there is nothing to watch" 0 $
 hk $IDA $SA wait > /dev/null 2> $T/w.err & W=$!
 sleep 0.6; cb ping $LA "wake up" >/dev/null; wait $W; expect "the waiter exits 42 on news" 42 $?
 grep -q '"wake up"' $T/w.err && ok "with the news on stderr" || bad "waiter: $(cat $T/w.err)"
+head -1 $T/w.err | grep -q "^gpushare: your other chat bbbb2222 pinged $LA" && ok "starting with what happened" || bad "waiter headline: $(head -1 $T/w.err)"
 hk $IDA $SA wait 2>/dev/null & W1=$!; sleep 0.6
 hk $IDA $SA wait 2>/dev/null & W2=$!; sleep 0.8
 kill -0 $W1 2>/dev/null && { bad "two waiters for one chat"; kill $W1; } || ok "a new waiter replaces the chat's old one"
